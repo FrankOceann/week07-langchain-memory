@@ -101,3 +101,14 @@ def test_build_retriever_returns_relevant_documents_with_source(tmp_path):
 def test_build_retriever_rejects_empty_directory(tmp_path):
     with pytest.raises(ValueError, match="没有可索引资料"):
         build_retriever(tmp_path, DeterministicEmbeddings())
+
+from main import validate_question
+
+
+def test_validate_question_rejects_blank_input():
+    with pytest.raises(ValueError, match="问题不能为空"):
+        validate_question("  ")
+
+
+def test_validate_question_strips_whitespace():
+    assert validate_question("  如何确认副作用？  ") == "如何确认副作用？"

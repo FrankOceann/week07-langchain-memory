@@ -20,3 +20,4 @@ def build_retriever(
     vector_store.add_documents(documents)
 
     return vector_store.as_retriever(search_kwargs={"k": top_k})
+
