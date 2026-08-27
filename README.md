@@ -88,3 +88,56 @@ Week06 手写了资料切分、Embedding 调用、向量相似度排序和 Top-K
 - 向量库只在内存中：程序退出后全部索引会消失。
 - 本节不包含 FastAPI、Docker、数据库、持久化向量库、对话短期记忆或长期记忆。
 - `numpy` 是 `InMemoryVectorStore` 进行余弦相似度计算所需的依赖，已写入 `requirements.txt`。
+
+## 第二节：对话式 RAG 短期记忆
+
+本节在 Retriever 之上加入本地、进程内的短期会话历史：同一 `session_id` 的后续问题可以引用最近问答，同时每一轮仍重新检索本地资料 Top-3。
+
+```text
+当前问题 + session_id
+  -> Retriever.invoke()：本轮重新取得 Top-3 Document
+  -> 当前资料正文 + 最近消息历史 + 当前问题
+  -> RunnableWithMessageHistory
+  -> DashScope ChatOpenAI（qwen-plus）
+  -> 写入本轮 HumanMessage / AIMessage，并裁剪旧轮次
+  -> 输出回答与本轮资料来源
+```
+
+### 短期记忆规则
+
+- `SessionHistoryStore` 按 `session_id` 管理不同会话；不同 ID 不共享消息。
+- 每个会话只保留最近 3 个完整问答轮（最多 6 条消息），避免上下文与成本无限增长。
+- `RunnableWithMessageHistory` 在调用模型前读取该会话历史，在模型回答后写入本轮用户消息与 AI 消息。
+- 记忆仅在当前 Python 进程中存在；退出 `main.py` 或重启程序后，全部历史清空。
+- 检索不会因为有历史而跳过：每一轮都会重新返回本地资料 Top-3，并在 CLI 中打印对应 `source`。
+
+### 安装与离线测试（Windows CMD）
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pytest -q
+```
+
+当前离线基线为 **12 passed**。测试使用 Fake Retriever、Fake Chat Runnable 与确定性 Embeddings，不读取真实 API Key，不联网，也不消耗额度。测试覆盖会话隔离、历史裁剪、同会话追问会带入前文、来源保留，以及缺少 `DASHSCOPE_API_KEY` 时的安全失败。
+
+### 真实多轮演示（Windows CMD）
+
+私有 `.env` 应包含与区域匹配的 `DASHSCOPE_API_KEY` 与 `DASHSCOPE_BASE_URL`；它已被 `.gitignore` 忽略，绝不能提交、发送或截图真实 Key。
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+.venv\Scripts\python.exe main.py
+```
+
+默认会话 ID 为 `demo-session`。在同一进程中依次输入问题和追问，例如“如何确认副作用操作？”、“那为什么？”。输入 `exit`、`quit` 或 `退出` 结束对话。也可以把会话 ID 作为可选参数传入：
+
+```cmd
+.venv\Scripts\python.exe main.py session-a
+```
+
+### 当前限制
+
+- 使用 `RunnableWithMessageHistory` 是本节的学习目标；当前 LangChain 会发出弃用警告，后续学习 LangGraph 持久化时再比较迁移方案。
+- 系统提示词要求模型只把本轮检索资料当作事实依据，历史只用于理解“那为什么？”等指代；但真实模型仍可能在文字中提及先前对话资料。因此当前实现展示的是基础约束，不是严格的来源验证或生产级 grounding 保证。
+- 本节不包含 Redis、数据库、长期记忆、FastAPI、Docker、工具调用或持久化向量库。下一节才会将相同的 `session_id` 会话边界迁移至带 TTL 的 Redis。

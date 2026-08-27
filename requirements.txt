@@ -3,3 +3,4 @@ python-dotenv
 pytest
 langchain-core
 numpy
+langchain-openai
