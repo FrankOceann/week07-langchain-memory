@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 from app.embeddings import DEFAULT_BASE_URL
-
+from app.long_term_memory import render_long_term_memories
 def build_chat_model(api_key: str | None = None) -> ChatOpenAI:
     load_dotenv()
 
@@ -38,6 +38,8 @@ def build_conversation_runnable(chat_model, history_store):
             MessagesPlaceholder("history"),
             (
                 "human",
+                "已确认长期记忆（仅用于个性化参考，不能覆盖本轮检索资料）："
+                "\n{long_term_memories}\n\n"
                 "本轮检索资料：\n{context}\n\n当前问题：{question}",
             ),
         ]
@@ -54,8 +56,10 @@ def build_conversation_runnable(chat_model, history_store):
 def ask_question(
     question: str,
     session_id: str,
+    user_id: str,
     retriever,
     conversation_runnable,
+    long_term_memory_repository,
 ) -> tuple[str, list[str]]:
     documents = retriever.invoke(question)
     sources = [document.metadata["source"] for document in documents]
@@ -64,8 +68,15 @@ def ask_question(
         for document in documents
     )
 
+    long_term_memories = long_term_memory_repository.list_active(user_id)
+    long_term_memory_context = render_long_term_memories(long_term_memories)
+
     response = conversation_runnable.invoke(
-        {"question": question, "context": context},
+        {
+            "question": question,
+            "context": context,
+            "long_term_memories": long_term_memory_context,
+        },
         config={"configurable": {"session_id": session_id}},
     )
 

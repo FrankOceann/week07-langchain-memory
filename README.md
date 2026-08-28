@@ -206,3 +206,76 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 - 本机 Compose 是单 Redis 容器学习环境，不包含认证、TLS、集群、高可用、监控或生产部署；当前未声明 Docker volume，因此执行 `docker compose down` 并删除容器后，容器内 Redis 数据不会作为持久化数据保留。
 - Redis 不可用时，客户端会抛出明确的 `redis.exceptions.ConnectionError`，并且不会静默回退为进程内历史；更友好的 CLI 错误展示留作后续工程化改进。
 - `RunnableWithMessageHistory` 仍会发出 LangChain 弃用警告。本节保留它以专注学习状态后端迁移，LangGraph 持久化将在后续专题比较。
+
+## 第四节：MySQL 结构化长期记忆
+
+本节在 Redis 短期会话状态之外，引入 MySQL 作为已确认长期记忆的权威数据源。它解决的是“同一用户跨会话、跨进程仍可保留的偏好、资料和事实”；它不是聊天记录的替代品。
+
+```text
+当前问题 + session_id + user_id
+  -> Redis：按 session_id 读取最近 3 轮会话消息（30 分钟滑动 TTL）
+  -> Retriever：为本轮问题重新检索 Top-3 资料
+  -> MySQL：按 user_id 查询有效长期记忆
+  -> 提示词：长期记忆仅作个性化参考，本轮检索资料仍是事实依据
+  -> ChatOpenAI（qwen-plus）生成回答
+```
+
+### 三类状态的边界
+
+| 组件 | 主键/边界 | 保存内容 | 生命周期与职责 |
+| --- | --- | --- | --- |
+| Redis | `session_id` | 最近用户/助手消息 | 短期会话上下文；最多 3 轮，30 分钟滑动 TTL。 |
+| MySQL | `user_id` | 人工确认的 `preference`、`profile`、`fact` | 长期结构化记忆；可跨会话读取，是权威数据源。 |
+| RAG 资料 | `source` | 本地资料块 | 本轮知识事实来源；每轮重新检索 Top-3。 |
+
+`user_id` 与 `session_id` 不能混用：一个用户可以创建多个会话；同一个会话也只属于一个当前用户。不同用户的 MySQL 记忆绝不能互相注入提示词。
+
+### 数据模型与安全规则
+
+表 `long_term_memories` 包含 `id`、`user_id`、`category`、`content`、`source`、`is_active`、`created_at`、`updated_at`，并建立 `(user_id, is_active, category, updated_at)` 复合索引，以支持“某用户的有效记忆”查询。
+
+- `category` 仅允许 `preference`、`profile`、`fact`。
+- 删除采用软停用：`is_active=False`；数据不被物理删除，保留审计线索。
+- 写入只通过明确的 `memory add` CLI 进行；模型不会自行新增、修改或停用记忆。
+- MySQL 查询发生在聊天模型调用之前；数据库不可用时，CLI 输出明确错误且不调用模型生成回答。
+- 长期记忆只用于个性化参考，不能覆盖本轮 RAG 资料，也不应被当作新的知识事实来源。
+
+### 本机 MySQL、迁移与私有配置（Windows CMD）
+
+`compose.yaml` 同时定义 Redis 与 MySQL。本项目的 MySQL 容器将宿主机 `13306` 映射到容器内 `3306`，避免占用常见的本机 `3306` 端口。
+
+私有 `.env` 除已有 DashScope 与 Redis 配置外，还需要填写 `MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD` 和与实际端口一致的 `MYSQL_URL`。不要提交、发送或截图该文件或任何真实密码。
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+docker compose up -d mysql
+docker compose ps
+.venv\Scripts\alembic.exe upgrade head
+.venv\Scripts\alembic.exe current
+```
+
+本节使用 Alembic 管理 schema。初始迁移位于 `migrations/versions/77ca49d48dd1_create_long_term_memories.py`；`alembic_version` 表记录数据库已经执行到的迁移版本。不要手工在生产环境改表后跳过迁移文件。
+
+### 长期记忆 CLI（Windows CMD）
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+
+.venv\Scripts\python.exe main.py memory add --user-id frank --category preference --content "回答时优先使用中文，并给出明确的 CMD 操作步骤。"
+.venv\Scripts\python.exe main.py memory list --user-id frank
+.venv\Scripts\python.exe main.py memory deactivate --memory-id 1
+
+.venv\Scripts\python.exe main.py chat --session-id mysql-demo-a --user-id frank
+```
+
+最后一条命令进入对话。对话读取的是 `frank` 的有效长期记忆，而 Redis 消息历史仍由 `mysql-demo-a` 这个会话 ID 隔离。
+
+### 验证结果与当前边界
+
+离线完整测试基线为 **25 passed, 2 warnings**。测试覆盖 MySQL URL/模型定义、Repository 用户隔离与软停用、聊天提示词只读取当前用户的记忆，以及“长期记忆查询失败时模型零调用”的失败路径。测试不会连接真实 MySQL、Redis 或调用真实模型。
+
+真实验收已验证：Docker MySQL 健康检查通过；Alembic 创建 `long_term_memories` 与 `alembic_version`；添加、列出、停用记忆可用；同一用户跨 `session_id` 能读取偏好，不同用户不能读取该偏好；停止 MySQL 后聊天明确失败且没有生成助手回答，恢复服务后可继续使用。
+
+- `RunnableWithMessageHistory` 仍存在 LangChain 弃用警告；本项目保留它以继续学习消息历史后端与状态边界，后续再比较 LangGraph。
+- 当前检索在注入历史之前以原始问题执行。因此“那为什么？”这类强依赖上下文的追问可能先检索不到足够资料并返回“资料不足”。这是严格 RAG 来源约束下的已知限制；后续可专门学习“历史感知的查询改写”。
+- MySQL 是结构化长期记忆的权威源，但尚未做语义相似记忆召回。Week07 第五节会接入 Milvus 作为向量候选索引，最终仍要回读并过滤 MySQL 的有效记录。
