@@ -83,7 +83,7 @@ Week06 手写了资料切分、Embedding 调用、向量相似度排序和 Top-K
 
 保留自己的 `load_documents()`、`DashScopeEmbeddings` 和 `build_retriever()`，是为了把业务规则（只读 `data/`、400 字符切分、50 字符重叠、来源格式、Top-3）固定在项目边界；使用 LangChain，是为了让内部组件遵循生态通用接口，未来可以替换向量库或接入链，而不需要重写业务规则。
 
-## 当前边界
+## 第一节与第二节的历史边界
 
 - 向量库只在内存中：程序退出后全部索引会消失。
 - 本节不包含 FastAPI、Docker、数据库、持久化向量库、对话短期记忆或长期记忆。
@@ -140,4 +140,69 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 
 - 使用 `RunnableWithMessageHistory` 是本节的学习目标；当前 LangChain 会发出弃用警告，后续学习 LangGraph 持久化时再比较迁移方案。
 - 系统提示词要求模型只把本轮检索资料当作事实依据，历史只用于理解“那为什么？”等指代；但真实模型仍可能在文字中提及先前对话资料。因此当前实现展示的是基础约束，不是严格的来源验证或生产级 grounding 保证。
-- 本节不包含 Redis、数据库、长期记忆、FastAPI、Docker、工具调用或持久化向量库。下一节才会将相同的 `session_id` 会话边界迁移至带 TTL 的 Redis。
+- 第二节的进程内实现不包含 Redis、数据库、长期记忆、FastAPI、工具调用或持久化向量库；下一节已将相同的 `session_id` 会话边界迁移至带 TTL 的 Redis。
+
+## 第三节：Redis 会话短期记忆
+
+本节将短期记忆从 Python 的 `dict` 迁移至 Redis。`RunnableWithMessageHistory`、Retriever 和提示词结构保持不变；变化的是消息历史后端：历史按 `session_id` 写入 Redis List，因此 Python 进程退出后，只要键尚未过期，下一次启动仍可读取。
+
+```text
+main.py
+  -> RedisHistoryStore.get(session_id)
+  -> RedisChatMessageHistory
+  -> Redis List: week07:chat_history:{session_id}
+  -> 最近消息 + 本轮检索资料
+  -> RunnableWithMessageHistory + ChatOpenAI
+  -> 写入本轮用户消息和 AI 消息，裁剪并刷新 TTL
+```
+
+### Redis 存储规则
+
+- 每个会话使用独立键，例如 `week07:chat_history:redis-demo`；不同 `session_id` 不共享消息。
+- `RedisChatMessageHistory` 把每条 LangChain `HumanMessage` / `AIMessage` 序列化为 JSON，作为 Redis List 的一个元素保存；读取时再还原为原始消息类型。
+- 每次写入依次执行 `RPUSH`、`LTRIM`、`EXPIRE`：追加本轮消息、保留最近 3 轮（最多 6 条）、将 TTL 重置为 1800 秒（30 分钟）。
+- 这属于滑动 TTL：持续聊天会刷新 30 分钟；停止聊天后，Redis 自动删除整个会话键。
+- `clear()` 只删除当前会话键，不影响其他会话。
+
+### 本机 Redis 服务与私有配置（Windows CMD）
+
+`compose.yaml` 只启动 Redis，不容器化 Python 应用。首次使用需启动 Docker Desktop，然后运行：
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+docker compose up -d redis
+docker compose exec redis redis-cli PING
+```
+
+预期最后输出 `PONG`。私有 `.env` 需要额外包含：
+
+```dotenv
+REDIS_URL=redis://localhost:6379/0
+```
+
+`.env.example` 只提供无凭据示例；真实 `.env` 仍被 `.gitignore` 忽略，绝不能提交、发送或截图。
+
+停止或恢复本机 Redis：
+
+```cmd
+docker compose stop redis
+docker compose start redis
+```
+
+### 离线测试与真实验收
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+.venv\Scripts\python.exe -m pytest -q
+```
+
+当前离线基线为 **15 passed, 1 warning**。新增测试通过 `fakeredis` 验证 Redis 会话隔离、最近轮次裁剪、TTL、`clear()` 和缺少 `REDIS_URL` 的失败路径；测试不需要 Docker、网络或真实 API Key。
+
+真实验收已完成：Docker Compose Redis 返回 `PONG`；`redis-demo` 完成两轮问答后，`TTL` 返回正数且 `LLEN` 为 4；重启 Python 并使用相同 `session_id` 后，追问“上一轮的‘那’指什么？”仍能正确引用之前的主题；手动把演示键设为 1 秒 TTL 后，Redis 返回 `EXISTS = 0`，确认自动过期删除。
+
+### 当前限制
+
+- Redis 只提供短期会话状态，不是长期语义记忆、关系数据库或向量数据库。下一节才会复用 Week05 SQLModel Memory API 学习长期记忆。
+- 本机 Compose 是单 Redis 容器学习环境，不包含认证、TLS、集群、高可用、监控或生产部署；当前未声明 Docker volume，因此执行 `docker compose down` 并删除容器后，容器内 Redis 数据不会作为持久化数据保留。
+- Redis 不可用时，客户端会抛出明确的 `redis.exceptions.ConnectionError`，并且不会静默回退为进程内历史；更友好的 CLI 错误展示留作后续工程化改进。
+- `RunnableWithMessageHistory` 仍会发出 LangChain 弃用警告。本节保留它以专注学习状态后端迁移，LangGraph 持久化将在后续专题比较。

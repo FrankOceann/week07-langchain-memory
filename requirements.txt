@@ -4,3 +4,5 @@ pytest
 langchain-core
 numpy
 langchain-openai
+redis
+fakeredis

@@ -7,7 +7,7 @@ from app.chat import (
     build_conversation_runnable,
 )
 from app.embeddings import DashScopeEmbeddings
-from app.memory import SessionHistoryStore
+from app.memory import RedisHistoryStore, build_redis_client
 from app.retriever import build_retriever
 
 
@@ -34,7 +34,11 @@ def main() -> int:
             DATA_DIRECTORY,
             DashScopeEmbeddings(),
         )
-        history_store = SessionHistoryStore(max_turns=3)
+        history_store = RedisHistoryStore(
+            build_redis_client(),
+            max_turns=3,
+            ttl_seconds=1800,
+        )
         conversation_runnable = build_conversation_runnable(
             build_chat_model(),
             history_store,

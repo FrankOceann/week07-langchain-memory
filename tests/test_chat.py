@@ -2,12 +2,13 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 import pytest
+import fakeredis
 from app.chat import (
     ask_question,
     build_chat_model,
     build_conversation_runnable,
 )
-from app.memory import SessionHistoryStore
+from app.memory import RedisHistoryStore
 
 
 class FakeRetriever:
@@ -29,7 +30,11 @@ def test_same_session_includes_previous_turn_and_preserves_sources():
 
     conversation_runnable = build_conversation_runnable(
         RunnableLambda(fake_response),
-        SessionHistoryStore(max_turns=3),
+        RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
     )
 
     first_answer, first_sources = ask_question(
