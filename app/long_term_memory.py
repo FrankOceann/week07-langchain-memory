@@ -72,6 +72,23 @@ class SQLAlchemyLongTermMemoryRepository:
         with self.session_factory() as session:
             return list(session.scalars(statement))
 
+    def list_active_by_ids(
+        self,
+        user_id: str,
+        memory_ids: list[int],
+    ) -> list[LongTermMemory]:
+        if not memory_ids:
+            return []
+
+        statement = select(LongTermMemory).where(
+            LongTermMemory.id.in_(memory_ids),
+            LongTermMemory.user_id == user_id,
+            LongTermMemory.is_active.is_(True),
+        )
+
+        with self.session_factory() as session:
+            return list(session.scalars(statement))
+
     def deactivate(self, memory_id: int) -> bool:
         with self.session_factory() as session:
             memory = session.get(LongTermMemory, memory_id)

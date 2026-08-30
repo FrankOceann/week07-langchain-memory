@@ -1,9 +1,10 @@
 import argparse
 import sys
 from pathlib import Path
-
+from app.memory_sync import MemorySyncService
+from app.milvus_memory import MilvusMemoryVectorIndex, build_milvus_client
 from sqlalchemy.exc import SQLAlchemyError
-
+from app.semantic_memory import SemanticLongTermMemoryService
 from app.chat import (
     ask_question,
     build_chat_model,
@@ -71,6 +72,7 @@ def validate_question(question: str) -> str:
 def run_memory_command(
     args,
     repository: SQLAlchemyLongTermMemoryRepository,
+    memory_sync_service,
 ) -> int:
     if args.memory_command == "add":
         memory = repository.add(
@@ -78,6 +80,16 @@ def run_memory_command(
             category=args.category,
             content=args.content,
         )
+        try:
+            memory_sync_service.sync(memory)
+        except Exception:
+            print(
+                "长期记忆已写入 MySQL，但 Milvus 同步失败。"
+                "请稍后重试同步。",
+                file=sys.stderr,
+            )
+            return 2
+
         print(f"已新增长期记忆：{memory.id}")
         return 0
 
@@ -117,9 +129,11 @@ def run_chat_command(
     args,
     repository: SQLAlchemyLongTermMemoryRepository,
 ) -> int:
+    embeddings = DashScopeEmbeddings()
+
     retriever = build_retriever(
         DATA_DIRECTORY,
-        DashScopeEmbeddings(),
+        embeddings,
     )
     history_store = RedisHistoryStore(
         build_redis_client(),
@@ -129,6 +143,16 @@ def run_chat_command(
     conversation_runnable = build_conversation_runnable(
         build_chat_model(),
         history_store,
+    )
+
+    vector_index = MilvusMemoryVectorIndex(
+        client=build_milvus_client(),
+        collection_name="long_term_memory_vectors",
+    )
+    semantic_memory_service = SemanticLongTermMemoryService(
+        embeddings=embeddings,
+        vector_index=vector_index,
+        long_term_memory_repository=repository,
     )
 
     print(f"当前会话：{args.session_id}")
@@ -156,7 +180,7 @@ def run_chat_command(
             user_id=args.user_id,
             retriever=retriever,
             conversation_runnable=conversation_runnable,
-            long_term_memory_repository=repository,
+            semantic_memory_service=semantic_memory_service,
         )
 
         print(f"助手：{answer}")
@@ -174,7 +198,23 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if args.command == "memory":
-            return run_memory_command(args, repository)
+            memory_sync_service = None
+
+            if args.memory_command == "add":
+                vector_index = MilvusMemoryVectorIndex(
+                    client=build_milvus_client(),
+                    collection_name="long_term_memory_vectors",
+                )
+                memory_sync_service = MemorySyncService(
+                    embeddings=DashScopeEmbeddings(),
+                    vector_index=vector_index,
+                )
+
+            return run_memory_command(
+                args,
+                repository,
+                memory_sync_service,
+            )
 
         if args.command == "chat":
             return run_chat_command(args, repository)

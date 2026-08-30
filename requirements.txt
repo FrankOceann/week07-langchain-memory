@@ -9,3 +9,4 @@ fakeredis
 SQLAlchemy
 alembic
 PyMySQL
+pymilvus==3.0.1

@@ -21,12 +21,23 @@ class FakeRetriever:
             )
         ]
 
-class FakeLongTermMemoryRepository:
+class FakeSemanticLongTermMemoryService:
     def __init__(self):
-        self.requested_user_ids = []
+        self.search_calls = []
 
-    def list_active(self, user_id: str, limit: int = 5):
-        self.requested_user_ids.append(user_id)
+    def search_active(
+        self,
+        user_id: str,
+        question: str,
+        limit: int = 3,
+    ):
+        self.search_calls.append(
+            {
+                "user_id": user_id,
+                "question": question,
+                "limit": limit,
+            }
+        )
 
         if user_id == "frank":
             return [
@@ -55,7 +66,7 @@ def test_same_session_includes_previous_turn_and_preserves_sources():
             ttl_seconds=30,
         ),
     )
-    long_term_memory_repository = FakeLongTermMemoryRepository()
+    semantic_memory_service = FakeSemanticLongTermMemoryService()
 
     first_answer, first_sources = ask_question(
         "如何确认副作用操作？",
@@ -63,7 +74,7 @@ def test_same_session_includes_previous_turn_and_preserves_sources():
         user_id="existing-user",
         retriever=FakeRetriever(),
         conversation_runnable=conversation_runnable,
-        long_term_memory_repository=long_term_memory_repository,
+        semantic_memory_service=semantic_memory_service,
     )
     second_answer, second_sources = ask_question(
         "那为什么？",
@@ -71,7 +82,7 @@ def test_same_session_includes_previous_turn_and_preserves_sources():
         user_id="existing-user",
         retriever=FakeRetriever(),
         conversation_runnable=conversation_runnable,
-        long_term_memory_repository=long_term_memory_repository,
+        semantic_memory_service=semantic_memory_service,
     )
 
     second_prompt_text = "\n".join(
@@ -99,7 +110,7 @@ def test_chat_includes_current_users_long_term_memories():
         received_prompts.append(prompt_value.messages)
         return AIMessage(content="假的回答")
 
-    repository = FakeLongTermMemoryRepository()
+    semantic_memory_service = FakeSemanticLongTermMemoryService()
     conversation_runnable = build_conversation_runnable(
         RunnableLambda(fake_response),
         RedisHistoryStore(
@@ -115,7 +126,7 @@ def test_chat_includes_current_users_long_term_memories():
         user_id="frank",
         retriever=FakeRetriever(),
         conversation_runnable=conversation_runnable,
-        long_term_memory_repository=repository,
+        semantic_memory_service=semantic_memory_service,
     )
 
     prompt_text = "\n".join(
@@ -124,12 +135,23 @@ def test_chat_includes_current_users_long_term_memories():
 
     assert answer == "假的回答"
     assert sources == ["agent_safety.txt#chunk-0"]
-    assert repository.requested_user_ids == ["frank"]
+    assert semantic_memory_service.search_calls == [
+    {
+        "user_id": "frank",
+        "question": "如何确认副作用操作？",
+        "limit": 3,
+    }
+]
     assert "[memory:101] (preference) 使用中文回答。" in prompt_text
 
 def test_long_term_memory_failure_does_not_call_chat_model():
-    class FailingLongTermMemoryRepository:
-        def list_active(self, user_id: str, limit: int = 5):
+    class FailingSemanticMemoryService:
+        def search_active(
+            self,
+            user_id: str,
+            question: str,
+            limit: int = 3,
+        ):
             raise ConnectionError("MySQL 不可用")
 
     class RecordingConversationRunnable:
@@ -149,7 +171,7 @@ def test_long_term_memory_failure_does_not_call_chat_model():
             user_id="frank",
             retriever=FakeRetriever(),
             conversation_runnable=conversation_runnable,
-            long_term_memory_repository=FailingLongTermMemoryRepository(),
+            semantic_memory_service=FailingSemanticMemoryService(),
         )
 
     assert conversation_runnable.calls == 0

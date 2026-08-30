@@ -68,3 +68,21 @@ def test_render_long_term_memories_marks_empty_and_includes_memory_id(
     assert render_long_term_memories([memory]) == (
         f"[memory:{memory.id}] (preference) 使用中文"
     )
+
+def test_repository_reads_only_current_users_active_candidate_ids(
+    repository,
+):
+    active = repository.add("frank", "preference", "有效记忆")
+    inactive = repository.add("frank", "profile", "已停用记忆")
+    other_user = repository.add("alice", "fact", "Alice 的记忆")
+
+    assert repository.deactivate(inactive.id) is True
+
+    memories = repository.list_active_by_ids(
+        "frank",
+        [other_user.id, inactive.id, active.id, 999],
+    )
+
+    assert [(memory.id, memory.user_id, memory.content) for memory in memories] == [
+        (active.id, "frank", "有效记忆"),
+    ]

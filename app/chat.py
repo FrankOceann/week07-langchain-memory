@@ -59,7 +59,7 @@ def ask_question(
     user_id: str,
     retriever,
     conversation_runnable,
-    long_term_memory_repository,
+    semantic_memory_service,
 ) -> tuple[str, list[str]]:
     documents = retriever.invoke(question)
     sources = [document.metadata["source"] for document in documents]
@@ -68,7 +68,10 @@ def ask_question(
         for document in documents
     )
 
-    long_term_memories = long_term_memory_repository.list_active(user_id)
+    long_term_memories = semantic_memory_service.search_active(
+        user_id=user_id,
+        question=question,
+    )
     long_term_memory_context = render_long_term_memories(long_term_memories)
 
     response = conversation_runnable.invoke(
