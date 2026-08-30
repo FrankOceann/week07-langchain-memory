@@ -1,5 +1,59 @@
 # Week07 LangChain Memory
 
+> 当前可运行版本已完成 Redis 短期记忆、MySQL 长期记忆与 Milvus 语义召回。下方第一至四节保留每个阶段的学习记录；实际运行请优先使用本节的“当前系统运行手册”。
+
+## 当前系统与运行手册
+
+当前项目是一个本地 CLI 形式的 RAG + Memory 学习闭环。它将三种状态明确分开：
+
+```text
+用户问题
+  -> Redis：按 session_id 读取最近 3 轮短期对话
+  -> 本地 RAG Retriever：重新检索本轮资料 Top-3
+  -> Milvus：按 user_id 做语义搜索，返回长期记忆候选 ID
+  -> MySQL：验证候选记录的 user_id 与 is_active，并读取权威正文
+  -> Chat 模型：使用资料作为事实依据、使用有效长期记忆作个性化参考
+```
+
+| 组件 | 边界 | 当前职责 |
+| --- | --- | --- |
+| Redis | `session_id` | 保存最近 3 个问答轮，30 分钟滑动 TTL。 |
+| MySQL | `user_id`、`memory_id` | 长期记忆权威来源；负责内容、类别和软停用状态。 |
+| Milvus | `user_id` 过滤 + `memory_id` | 只保存向量索引和候选 ID，不作为长期记忆的权威来源。 |
+| 本地 RAG 资料 | `source` | 每轮回答的事实依据；默认检索 Top-3。 |
+
+### 启动开发环境（Windows CMD）
+
+```cmd
+cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchain-memory"
+copy .env.example .env
+notepad .env
+docker compose up -d
+docker compose ps
+.venv\Scripts\alembic.exe upgrade head
+.venv\Scripts\python.exe -m pytest -q
+```
+
+私有 `.env` 除 DashScope、Redis 与 MySQL 配置外，还必须有：
+
+```dotenv
+MILVUS_URI=http://127.0.0.1:19530
+```
+
+`.env` 不可提交、发送或截图。Docker Compose 会启动 Redis、MySQL、etcd、MinIO 与 Milvus；Milvus 的 Python 客户端连接端口为 `19530`。
+
+### 当前 CLI 用法（Windows CMD）
+
+```cmd
+.venv\Scripts\python.exe main.py memory add --user-id frank --category preference --content "回答时优先使用中文，并给出简洁要点。"
+.venv\Scripts\python.exe main.py memory list --user-id frank
+.venv\Scripts\python.exe main.py memory deactivate --memory-id 1
+
+.venv\Scripts\python.exe main.py chat --session-id demo-session --user-id frank
+```
+
+当前完整离线测试基线为 **42 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
+
 ## 第一节：LangChain Retriever
 
 本项目用于学习如何使用 LangChain 复现 Week06 的手写 RAG Retriever。
@@ -40,7 +94,9 @@ py -3.10 -m venv .venv
 
 测试使用固定输出的 Fake Embeddings，不会调用 DashScope、不会消耗 API 额度，也不依赖真实 API Key。
 
-## 真实检索演示（Windows CMD）
+## 第一节历史检索演示（Windows CMD）
+
+> 本小节记录第一节完成时的独立 Retriever 入口；当前 `main.py` 已改为 `chat` 与 `memory` 子命令，实际运行请使用“当前系统与运行手册”。
 
 先在本机创建私密配置：
 
@@ -121,7 +177,9 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 
 当前离线基线为 **12 passed**。测试使用 Fake Retriever、Fake Chat Runnable 与确定性 Embeddings，不读取真实 API Key，不联网，也不消耗额度。测试覆盖会话隔离、历史裁剪、同会话追问会带入前文、来源保留，以及缺少 `DASHSCOPE_API_KEY` 时的安全失败。
 
-### 真实多轮演示（Windows CMD）
+### 历史多轮演示（Windows CMD）
+
+> 本小节的命令对应第二节完成时的入口形式。当前会话入口为 `main.py chat --session-id <ID> --user-id <用户>`，请使用文档顶部的当前 CLI 用法。
 
 私有 `.env` 应包含与区域匹配的 `DASHSCOPE_API_KEY` 与 `DASHSCOPE_BASE_URL`；它已被 `.gitignore` 忽略，绝不能提交、发送或截图真实 Key。
 
@@ -242,7 +300,7 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 
 ### 本机 MySQL、迁移与私有配置（Windows CMD）
 
-`compose.yaml` 同时定义 Redis 与 MySQL。本项目的 MySQL 容器将宿主机 `13306` 映射到容器内 `3306`，避免占用常见的本机 `3306` 端口。
+当前 `compose.yaml` 定义 Redis、MySQL、etcd、MinIO 与 Milvus。本项目的 MySQL 容器将宿主机 `13306` 映射到容器内 `3306`，避免占用常见的本机 `3306` 端口。
 
 私有 `.env` 除已有 DashScope 与 Redis 配置外，还需要填写 `MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD` 和与实际端口一致的 `MYSQL_URL`。不要提交、发送或截图该文件或任何真实密码。
 
@@ -278,4 +336,75 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 
 - `RunnableWithMessageHistory` 仍存在 LangChain 弃用警告；本项目保留它以继续学习消息历史后端与状态边界，后续再比较 LangGraph。
 - 当前检索在注入历史之前以原始问题执行。因此“那为什么？”这类强依赖上下文的追问可能先检索不到足够资料并返回“资料不足”。这是严格 RAG 来源约束下的已知限制；后续可专门学习“历史感知的查询改写”。
-- MySQL 是结构化长期记忆的权威源，但尚未做语义相似记忆召回。Week07 第五节会接入 Milvus 作为向量候选索引，最终仍要回读并过滤 MySQL 的有效记录。
+- MySQL 是结构化长期记忆的权威源；第五节已接入 Milvus 作为语义候选索引，并在应用层回读和过滤 MySQL 的有效记录。
+
+## 第五节：Milvus 语义长期记忆
+
+本节在 MySQL 权威长期记忆之上引入 Milvus。Milvus 的职责不是保存完整业务记录，而是把记忆内容转换为向量后，按照“意思是否相近”快速召回候选 `memory_id`；候选记录必须回 MySQL 验证后才能进入模型上下文。
+
+```text
+写入：memory add
+  -> MySQL 保存 LongTermMemory，生成 memory_id
+  -> DashScope Embeddings 生成 1024 维向量
+  -> Milvus upsert：memory_id + user_id + embedding
+
+读取：chat
+  -> 当前问题生成 1024 维向量
+  -> Milvus 按 user_id 过滤并返回相近 memory_id
+  -> MySQL 按 user_id、memory_id、is_active=True 回读
+  -> 按 Milvus 相似度顺序注入有效长期记忆
+```
+
+### 数据模型与安全边界
+
+Milvus collection 名称为 `long_term_memory_vectors`，包含以下字段：
+
+| 字段 | 用途 |
+| --- | --- |
+| `memory_id` | MySQL `long_term_memories.id`；Milvus 主键与关联键。 |
+| `user_id` | Milvus 搜索过滤条件，避免跨用户候选召回。 |
+| `embedding` | DashScope 文本 embedding，维度固定为 1024，使用 COSINE 距离。 |
+
+- MySQL 是长期记忆的权威源；Milvus 只保存可重建的索引数据。
+- 聊天读取时必须再次校验 `user_id` 和 `is_active=True`，因此 MySQL 软停用能立即阻止旧 Milvus 向量被使用。
+- 模型不能自行写入、修改或停用长期记忆；写入仅经显式 `memory add` CLI。
+- Milvus、MySQL 或 embedding 任一环节异常时，不静默回退，也不调用聊天模型生成回答。
+
+### 本机验收（Windows CMD）
+
+启动全部依赖并完成迁移后，可以按以下顺序验证：
+
+```cmd
+.venv\Scripts\python.exe main.py memory add --user-id frank --category preference --content "用户 frank 偏好中文、简洁回答。"
+.venv\Scripts\python.exe main.py chat --session-id milvus-demo --user-id frank
+```
+
+在聊天中输入“之后请用什么风格回答我？”，应能得到与这条长期偏好一致的回答。再换用新的 `session_id`，同一 `user_id` 仍能得到该偏好，证明它来自跨会话长期记忆而不是 Redis 历史。
+
+也应使用另一用户（如 `bob`）进行相同提问，确认不会召回 Frank 的偏好；停用某条记忆后，即使直接查询 Milvus 仍能看到该向量，聊天也不应再使用它。
+
+### Milvus 一致性说明
+
+Milvus 的默认 bounded staleness 一致性可能造成“刚写入、立即搜索尚未可见”的短暂现象。本项目已在手动验收中观察到这一点。生产场景不能简单地在每次写入后强制 flush；应按业务场景明确选择一致性策略：例如“写后立即展示”的交互可考虑 Session 或 Strong，而可容忍短暂不可见的批量检索可使用 Bounded。
+
+### 当前限制
+
+- 当前写入同步发生在 CLI 进程内：MySQL 成功但 Milvus 失败时仅提示稍后重试，尚无后台补偿机制。
+- `user_id` 目前由 CLI 参数提供，尚未接入真实认证、授权和租户身份。
+- Milvus 为本机 Standalone 学习部署，未包含 TLS、RBAC、备份、高可用、监控或容量规划。
+- 当前 RAG 文档仍使用进程内 `InMemoryVectorStore`；Milvus 目前只索引长期记忆，而不是 `data/` 中的 RAG 资料。
+
+## 面向企业开发的后续学习路线
+
+学习不以“继续叠加框架”为目标，而以每一阶段解决一个真实工程风险为目标。
+
+| 优先级 | 学习主题 | 要解决的企业问题 | 交付物 |
+| --- | --- | --- | --- |
+| 1 | Outbox 异步索引同步 | MySQL 成功、Milvus 失败时，索引可能永久缺失。 | `memory_outbox`、幂等 worker、重试/失败状态、补偿 CLI 与测试。 |
+| 2 | 历史感知查询改写与 RAG 评测 | “那为什么？”等追问用原始问题检索，召回质量不足。 | 查询改写边界、固定评测集、Recall@K/来源正确性记录。 |
+| 3 | FastAPI + 身份认证 + 租户授权 | CLI 参数不能代表可信身份；企业不能相信客户端传来的 user_id。 | JWT 身份解析、服务端 tenant/user 边界、接口测试。 |
+| 4 | 可观测性与真实集成测试 | 出现慢请求、同步堆积或串租户时，需要可定位、可报警。 | 结构化日志、请求 ID、耗时/失败指标、Docker 集成测试。 |
+| 5 | LangGraph 状态迁移 | `RunnableWithMessageHistory` 已弃用，需要可恢复、可审计的工作流状态。 | 迁移设计、checkpointer、状态回放与回归测试。 |
+| 6 | 部署、安全与运维 | 学习环境不等于生产环境。 | 应用容器化、密钥管理、TLS/RBAC、备份恢复、健康检查与发布流程。 |
+
+下一阶段从 **Outbox 异步索引同步** 开始：它直接补上当前架构最重要的数据一致性风险，并训练事务、异步任务、幂等、重试和可观测性这些企业高频能力。
