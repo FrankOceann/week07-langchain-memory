@@ -67,6 +67,126 @@ def test_memory_commands_parse_expected_arguments():
     )
     assert deactivate.memory_id == 101
 
+
+def test_memory_outbox_drain_parses_limit():
+    parser = build_parser()
+
+    args = parser.parse_args(
+        ["memory", "outbox", "drain", "--limit", "7"]
+    )
+
+    assert (
+        args.command,
+        args.memory_command,
+        args.outbox_command,
+        args.limit,
+    ) == ("memory", "outbox", "drain", 7)
+
+
+def test_memory_outbox_retry_failed_parses_all_flag():
+    parser = build_parser()
+
+    args = parser.parse_args(
+        ["memory", "outbox", "retry-failed", "--all"]
+    )
+
+    assert (
+        args.command,
+        args.memory_command,
+        args.outbox_command,
+        args.all,
+    ) == ("memory", "outbox", "retry-failed", True)
+
+
+def test_memory_outbox_drain_runs_worker(capsys):
+    class RecordingOutboxWorker:
+        def __init__(self):
+            self.limits = []
+
+        def drain(self, limit):
+            self.limits.append(limit)
+            return {
+                "succeeded": 2,
+                "retrying": 1,
+                "failed": 0,
+            }
+
+    worker = RecordingOutboxWorker()
+    args = SimpleNamespace(
+        memory_command="outbox",
+        outbox_command="drain",
+        limit=7,
+    )
+
+    exit_code = run_memory_command(
+        args,
+        repository=object(),
+        memory_sync_service=None,
+        outbox_worker=worker,
+    )
+
+    assert exit_code == 0
+    assert worker.limits == [7]
+    assert capsys.readouterr().out == (
+        "索引任务处理结果：成功 2，重试 1，失败 0\n"
+    )
+
+
+def test_memory_outbox_retry_failed_requeues_events(capsys):
+    class RecordingOutboxRepository:
+        def __init__(self):
+            self.retry_times = []
+
+        def retry_all_failed(self, now):
+            self.retry_times.append(now)
+            return 3
+
+    outbox_repository = RecordingOutboxRepository()
+    args = SimpleNamespace(
+        memory_command="outbox",
+        outbox_command="retry-failed",
+        all=True,
+    )
+
+    exit_code = run_memory_command(
+        args,
+        repository=object(),
+        memory_sync_service=None,
+        outbox_repository=outbox_repository,
+    )
+
+    assert exit_code == 0
+    assert len(outbox_repository.retry_times) == 1
+    assert capsys.readouterr().out == (
+        "已重新排队失败索引任务：3\n"
+    )
+
+
+def test_memory_add_creates_outbox_task_without_inline_sync(capsys):
+    class SyncServiceThatMustNotRun:
+        def sync(self, memory):
+            raise AssertionError("memory add 不应同步 Milvus。")
+
+    memory = SimpleNamespace(id=101, user_id="frank", content="优先使用中文")
+    repository = FakeMemoryRepository(memory)
+    args = SimpleNamespace(
+        memory_command="add",
+        user_id="frank",
+        category="preference",
+        content="优先使用中文",
+    )
+
+    exit_code = run_memory_command(
+        args,
+        repository,
+        SyncServiceThatMustNotRun(),
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        "已新增长期记忆并创建索引任务：101\n"
+    )
+
 class FakeMemoryRepository:
     def __init__(self, memory):
         self.memory = memory
@@ -91,7 +211,7 @@ class RecordingMemorySyncService:
         self.synced_memories.append(memory)
 
 
-def test_memory_add_syncs_saved_mysql_memory_to_milvus(capsys):
+def test_memory_add_creates_outbox_task_without_syncing_milvus(capsys):
     memory = SimpleNamespace(id=101, user_id="frank", content="优先使用中文")
     repository = FakeMemoryRepository(memory)
     memory_sync_service = RecordingMemorySyncService()
@@ -116,10 +236,12 @@ def test_memory_add_syncs_saved_mysql_memory_to_milvus(capsys):
             "content": "优先使用中文",
         }
     ]
-    assert memory_sync_service.synced_memories == [memory]
-    assert capsys.readouterr().out == "已新增长期记忆：101\n"
+    assert memory_sync_service.synced_memories == []
+    assert capsys.readouterr().out == (
+        "已新增长期记忆并创建索引任务：101\n"
+    )
 
-def test_main_memory_add_syncs_mysql_memory_to_milvus(
+def test_main_memory_add_does_not_create_sync_dependencies(
     monkeypatch,
     capsys,
 ):
@@ -210,23 +332,19 @@ def test_main_memory_add_syncs_mysql_memory_to_milvus(
         "category": "preference",
         "content": "优先使用中文",
     }
-    assert captured["embedded_question"] == "优先使用中文"
-    assert captured["collection_name"] == "long_term_memory_vectors"
-    assert captured["vector_index"].upsert_calls == [
-        {
-            "memory_id": 101,
-            "user_id": "frank",
-            "vector": vector,
-        }
-    ]
-    assert capsys.readouterr().out == "已新增长期记忆：101\n"
+    assert "embedded_question" not in captured
+    assert "collection_name" not in captured
+    assert "vector_index" not in captured
+    assert capsys.readouterr().out == (
+        "已新增长期记忆并创建索引任务：101\n"
+    )
 
 class FailingMemorySyncService:
     def sync(self, memory):
         raise RuntimeError("Milvus 暂时不可用")
 
 
-def test_memory_add_reports_sync_failure_after_mysql_is_saved(capsys):
+def test_memory_add_succeeds_when_sync_service_is_unavailable(capsys):
     memory = SimpleNamespace(
         id=101,
         user_id="frank",
@@ -249,7 +367,7 @@ def test_memory_add_reports_sync_failure_after_mysql_is_saved(capsys):
 
     captured = capsys.readouterr()
 
-    assert exit_code == 2
+    assert exit_code == 0
     assert repository.add_calls == [
         {
             "user_id": "frank",
@@ -257,10 +375,10 @@ def test_memory_add_reports_sync_failure_after_mysql_is_saved(capsys):
             "content": "优先使用中文",
         }
     ]
-    assert captured.out == ""
-    assert captured.err == (
-        "长期记忆已写入 MySQL，但 Milvus 同步失败。请稍后重试同步。\n"
+    assert captured.out == (
+        "已新增长期记忆并创建索引任务：101\n"
     )
+    assert captured.err == ""
 
 def test_chat_command_passes_semantic_memory_service_to_question(
     monkeypatch,

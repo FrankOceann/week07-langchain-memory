@@ -1,12 +1,17 @@
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.long_term_memory import (
     SQLAlchemyLongTermMemoryRepository,
     render_long_term_memories,
 )
-from app.models import Base
+from app.models import (
+    Base,
+    MemoryOutbox,
+    OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+    OUTBOX_STATUS_PENDING,
+)
 
 
 @pytest.fixture
@@ -21,6 +26,96 @@ def repository():
         )
     )
 
+def test_repository_add_creates_pending_outbox_event():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(
+        bind=engine,
+        expire_on_commit=False,
+    )
+    repository = SQLAlchemyLongTermMemoryRepository(session_factory)
+
+    memory = repository.add(
+        "frank",
+        "preference",
+        "回答时优先使用中文。",
+    )
+
+    with session_factory() as session:
+        events = list(
+            session.scalars(
+                select(MemoryOutbox).order_by(MemoryOutbox.id)
+            )
+        )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.memory_id == memory.id
+    assert event.event_type == OUTBOX_EVENT_MEMORY_INDEX_REQUESTED
+    assert event.status == OUTBOX_STATUS_PENDING
+    assert event.attempt_count == 0
+    assert event.available_at is not None
+    assert event.lease_token is None
+    assert event.lease_expires_at is None
+    assert event.last_error is None
+    assert event.processed_at is None
+
+def test_repository_deactivate_creates_pending_outbox_event():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(
+        bind=engine,
+        expire_on_commit=False,
+    )
+    repository = SQLAlchemyLongTermMemoryRepository(session_factory)
+
+    memory = repository.add(
+        "frank",
+        "preference",
+        "回答时优先使用中文。",
+    )
+
+    assert repository.deactivate(memory.id) is True
+
+    with session_factory() as session:
+        events = list(
+            session.scalars(
+                select(MemoryOutbox).order_by(MemoryOutbox.id)
+            )
+        )
+
+    assert len(events) == 2
+    assert [event.memory_id for event in events] == [
+        memory.id,
+        memory.id,
+    ]
+    assert [event.event_type for event in events] == [
+        OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+        OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+    ]
+    assert [event.status for event in events] == [
+        OUTBOX_STATUS_PENDING,
+        OUTBOX_STATUS_PENDING,
+    ]
+
+def test_repository_get_by_id_returns_inactive_memory_for_worker(
+    repository,
+):
+    memory = repository.add(
+        "frank",
+        "preference",
+        "回答时优先使用中文。",
+    )
+
+    assert repository.deactivate(memory.id) is True
+
+    found = repository.get_by_id(memory.id)
+
+    assert found is not None
+    assert found.id == memory.id
+    assert found.user_id == "frank"
+    assert found.is_active is False
+    assert repository.get_by_id(999) is None
 
 def test_repository_isolates_users_and_hides_deactivated_memory(
     repository,

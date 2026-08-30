@@ -1,6 +1,6 @@
 # Week07 LangChain Memory
 
-> 当前可运行版本已完成 Redis 短期记忆、MySQL 长期记忆与 Milvus 语义召回。下方第一至四节保留每个阶段的学习记录；实际运行请优先使用本节的“当前系统运行手册”。
+> 当前可运行版本已完成 Redis 短期记忆、MySQL 权威长期记忆、Milvus 语义召回，以及 MySQL Outbox 异步索引同步。下方各节保留阶段学习记录；实际运行请优先使用本节的“当前系统运行手册”。
 
 ## 当前系统与运行手册
 
@@ -18,7 +18,7 @@
 | 组件 | 边界 | 当前职责 |
 | --- | --- | --- |
 | Redis | `session_id` | 保存最近 3 个问答轮，30 分钟滑动 TTL。 |
-| MySQL | `user_id`、`memory_id` | 长期记忆权威来源；负责内容、类别和软停用状态。 |
+| MySQL | `user_id`、`memory_id`、Outbox 事件 | 长期记忆权威来源；负责内容、类别、软停用状态及待索引任务。 |
 | Milvus | `user_id` 过滤 + `memory_id` | 只保存向量索引和候选 ID，不作为长期记忆的权威来源。 |
 | 本地 RAG 资料 | `source` | 每轮回答的事实依据；默认检索 Top-3。 |
 
@@ -48,11 +48,13 @@ MILVUS_URI=http://127.0.0.1:19530
 .venv\Scripts\python.exe main.py memory add --user-id frank --category preference --content "回答时优先使用中文，并给出简洁要点。"
 .venv\Scripts\python.exe main.py memory list --user-id frank
 .venv\Scripts\python.exe main.py memory deactivate --memory-id 1
+.venv\Scripts\python.exe main.py memory outbox drain --limit 10
+.venv\Scripts\python.exe main.py memory outbox retry-failed --all
 
 .venv\Scripts\python.exe main.py chat --session-id demo-session --user-id frank
 ```
 
-当前完整离线测试基线为 **42 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
+当前完整离线测试基线为 **61 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
 
 ## 第一节：LangChain Retriever
 
@@ -343,10 +345,12 @@ cd /d "D:\桌面\所有codex项目\AI agent 开发\python 学习\week07-langchai
 本节在 MySQL 权威长期记忆之上引入 Milvus。Milvus 的职责不是保存完整业务记录，而是把记忆内容转换为向量后，按照“意思是否相近”快速召回候选 `memory_id`；候选记录必须回 MySQL 验证后才能进入模型上下文。
 
 ```text
-写入：memory add
-  -> MySQL 保存 LongTermMemory，生成 memory_id
-  -> DashScope Embeddings 生成 1024 维向量
-  -> Milvus upsert：memory_id + user_id + embedding
+写入：memory add / memory deactivate
+  -> 一个 MySQL 事务：保存或软停用 LongTermMemory + 创建 memory_outbox 事件
+  -> 命令立即成功；不在写入路径调用 Embedding 或 Milvus
+  -> memory outbox drain 认领事件并回读 MySQL 当前权威状态
+       -> active：DashScope Embeddings + Milvus upsert
+       -> inactive 或记录不存在：Milvus delete(memory_id)
 
 读取：chat
   -> 当前问题生成 1024 维向量
@@ -370,6 +374,23 @@ Milvus collection 名称为 `long_term_memory_vectors`，包含以下字段：
 - 模型不能自行写入、修改或停用长期记忆；写入仅经显式 `memory add` CLI。
 - Milvus、MySQL 或 embedding 任一环节异常时，不静默回退，也不调用聊天模型生成回答。
 
+### Outbox 异步索引同步
+
+`memory_outbox` 是 MySQL 中的持久化索引任务表。它不保存记忆正文或向量，只保存 `memory_id`、处理状态、重试次数、下次可执行时间、租约和错误摘要。worker 每次执行都回读 MySQL，因此旧任务不会把过时内容重新写回 Milvus。
+
+| 状态 | 含义 |
+| --- | --- |
+| `pending` | 等待 worker 处理或重试。 |
+| `processing` | 已被 worker 认领，并持有 60 秒租约。 |
+| `succeeded` | 已成功 upsert 或删除对应 Milvus 向量。 |
+| `failed` | 已连续失败 3 次，等待人工补偿。 |
+
+- MySQL 记忆变更与 Outbox 事件在同一事务提交，因此不会再出现“记忆已保存但没有任何可重试索引任务”的缺口。
+- Outbox 是 at-least-once 投递：同一任务可能被重复执行。Milvus 使用 `memory_id` 主键 upsert，delete 也按该 ID 执行，因此重复操作安全。
+- 第 1、2 次失败分别延迟 1、2 秒后重试；第 3 次失败进入 `failed`。租约到期的 `processing` 事件可被新 worker 重新认领。
+- `memory outbox retry-failed --all` 只把失败事件重新排队；之后运行 `drain` 才会真正访问 Embedding 与 Milvus。
+- 本节离线测试已验证状态机、幂等目标操作和 CLI 装配；真实 MySQL/Milvus 验收需在不展示私有 `.env` 的前提下另行执行。
+
 ### 本机验收（Windows CMD）
 
 启动全部依赖并完成迁移后，可以按以下顺序验证：
@@ -389,7 +410,7 @@ Milvus 的默认 bounded staleness 一致性可能造成“刚写入、立即搜
 
 ### 当前限制
 
-- 当前写入同步发生在 CLI 进程内：MySQL 成功但 Milvus 失败时仅提示稍后重试，尚无后台补偿机制。
+- worker 目前由人工运行 CLI `memory outbox drain`，不是常驻后台服务；生产环境通常会使用调度器、队列或独立 worker 进程触发相同的状态机。
 - `user_id` 目前由 CLI 参数提供，尚未接入真实认证、授权和租户身份。
 - Milvus 为本机 Standalone 学习部署，未包含 TLS、RBAC、备份、高可用、监控或容量规划。
 - 当前 RAG 文档仍使用进程内 `InMemoryVectorStore`；Milvus 目前只索引长期记忆，而不是 `data/` 中的 RAG 资料。
@@ -400,11 +421,9 @@ Milvus 的默认 bounded staleness 一致性可能造成“刚写入、立即搜
 
 | 优先级 | 学习主题 | 要解决的企业问题 | 交付物 |
 | --- | --- | --- | --- |
-| 1 | Outbox 异步索引同步 | MySQL 成功、Milvus 失败时，索引可能永久缺失。 | `memory_outbox`、幂等 worker、重试/失败状态、补偿 CLI 与测试。 |
-| 2 | 历史感知查询改写与 RAG 评测 | “那为什么？”等追问用原始问题检索，召回质量不足。 | 查询改写边界、固定评测集、Recall@K/来源正确性记录。 |
-| 3 | FastAPI + 身份认证 + 租户授权 | CLI 参数不能代表可信身份；企业不能相信客户端传来的 user_id。 | JWT 身份解析、服务端 tenant/user 边界、接口测试。 |
-| 4 | 可观测性与真实集成测试 | 出现慢请求、同步堆积或串租户时，需要可定位、可报警。 | 结构化日志、请求 ID、耗时/失败指标、Docker 集成测试。 |
-| 5 | LangGraph 状态迁移 | `RunnableWithMessageHistory` 已弃用，需要可恢复、可审计的工作流状态。 | 迁移设计、checkpointer、状态回放与回归测试。 |
-| 6 | 部署、安全与运维 | 学习环境不等于生产环境。 | 应用容器化、密钥管理、TLS/RBAC、备份恢复、健康检查与发布流程。 |
+| 1 | LangGraph 状态迁移 | `RunnableWithMessageHistory` 已弃用，需要可恢复、可审计的工作流状态。 | 显式 State、节点/边、checkpointer、interrupt 与状态回放。 |
+| 2 | FastAPI + 身份认证 + 租户授权 | CLI 参数不能代表可信身份；企业不能相信客户端传来的 user_id。 | JWT 身份解析、服务端 tenant/user 边界、接口测试。 |
+| 3 | 可观测性与真实集成测试 | 出现慢请求、同步堆积或串租户时，需要可定位、可报警。 | 结构化日志、请求 ID、耗时/失败指标、Docker 集成测试。 |
+| 4 | 部署、安全与运维 | 学习环境不等于生产环境。 | 应用容器化、密钥管理、TLS/RBAC、备份恢复、健康检查与发布流程。 |
 
-下一阶段从 **Outbox 异步索引同步** 开始：它直接补上当前架构最重要的数据一致性风险，并训练事务、异步任务、幂等、重试和可观测性这些企业高频能力。
+下一阶段进入 **LangGraph**：以当前已经可恢复、可补偿的记忆基础设施为底座，学习显式工作流状态、checkpoint、恢复执行与人工审批。

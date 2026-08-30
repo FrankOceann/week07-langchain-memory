@@ -96,6 +96,17 @@ class MilvusMemoryVectorIndex:
             ],
         )
 
+    def delete(self, memory_id: int) -> None:
+        if memory_id < 1:
+            raise ValueError("memory_id 必须至少为 1。")
+
+        self.ensure_collection()
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            ids=[memory_id],
+        )
+
     def search(
         self,
         user_id: str,

@@ -1,8 +1,10 @@
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 from app.memory_sync import MemorySyncService
 from app.milvus_memory import MilvusMemoryVectorIndex, build_milvus_client
+from app.outbox import MemoryOutboxRepository, MemoryOutboxWorker
 from sqlalchemy.exc import SQLAlchemyError
 from app.semantic_memory import SemanticLongTermMemoryService
 from app.chat import (
@@ -57,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
     deactivate = memory_commands.add_parser("deactivate")
     deactivate.add_argument("--memory-id", type=int, required=True)
 
+    outbox = memory_commands.add_parser("outbox")
+    outbox_commands = outbox.add_subparsers(
+        dest="outbox_command",
+        required=True,
+    )
+    drain = outbox_commands.add_parser("drain")
+    drain.add_argument("--limit", type=int, default=10)
+    retry_failed = outbox_commands.add_parser("retry-failed")
+    retry_failed.add_argument("--all", action="store_true", required=True)
+
     return parser
 
 
@@ -73,6 +85,8 @@ def run_memory_command(
     args,
     repository: SQLAlchemyLongTermMemoryRepository,
     memory_sync_service,
+    outbox_worker=None,
+    outbox_repository=None,
 ) -> int:
     if args.memory_command == "add":
         memory = repository.add(
@@ -80,17 +94,8 @@ def run_memory_command(
             category=args.category,
             content=args.content,
         )
-        try:
-            memory_sync_service.sync(memory)
-        except Exception:
-            print(
-                "长期记忆已写入 MySQL，但 Milvus 同步失败。"
-                "请稍后重试同步。",
-                file=sys.stderr,
-            )
-            return 2
 
-        print(f"已新增长期记忆：{memory.id}")
+        print(f"已新增长期记忆并创建索引任务：{memory.id}")
         return 0
 
     if args.memory_command == "list":
@@ -120,6 +125,36 @@ def run_memory_command(
             return 1
 
         print(f"已停用长期记忆：{args.memory_id}")
+        return 0
+
+    if args.memory_command == "outbox":
+        if args.outbox_command == "retry-failed":
+            if not args.all:
+                raise ValueError("retry-failed 必须使用 --all。")
+
+            if outbox_repository is None:
+                raise ValueError("缺少 Outbox Repository。")
+
+            count = outbox_repository.retry_all_failed(datetime.now())
+            print(f"已重新排队失败索引任务：{count}")
+            return 0
+
+        if args.outbox_command != "drain":
+            raise ValueError("未知的 outbox 子命令。")
+
+        if args.limit < 1:
+            raise ValueError("limit 必须至少为 1。")
+
+        if outbox_worker is None:
+            raise ValueError("缺少 Outbox worker。")
+
+        result = outbox_worker.drain(args.limit)
+        print(
+            "索引任务处理结果："
+            f"成功 {result['succeeded']}，"
+            f"重试 {result['retrying']}，"
+            f"失败 {result['failed']}"
+        )
         return 0
 
     raise ValueError("未知的 memory 子命令。")
@@ -199,21 +234,36 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "memory":
             memory_sync_service = None
+            outbox_worker = None
+            outbox_repository = None
 
-            if args.memory_command == "add":
-                vector_index = MilvusMemoryVectorIndex(
-                    client=build_milvus_client(),
-                    collection_name="long_term_memory_vectors",
+            if args.memory_command == "outbox":
+                outbox_repository = MemoryOutboxRepository(
+                    build_session_factory()
                 )
-                memory_sync_service = MemorySyncService(
-                    embeddings=DashScopeEmbeddings(),
-                    vector_index=vector_index,
-                )
+
+                if args.outbox_command == "drain":
+                    vector_index = MilvusMemoryVectorIndex(
+                        client=build_milvus_client(),
+                        collection_name="long_term_memory_vectors",
+                    )
+                    memory_sync_service = MemorySyncService(
+                        embeddings=DashScopeEmbeddings(),
+                        vector_index=vector_index,
+                    )
+                    outbox_worker = MemoryOutboxWorker(
+                        outbox_repository=outbox_repository,
+                        long_term_memory_repository=repository,
+                        memory_sync_service=memory_sync_service,
+                        vector_index=vector_index,
+                    )
 
             return run_memory_command(
                 args,
                 repository,
                 memory_sync_service,
+                outbox_worker,
+                outbox_repository,
             )
 
         if args.command == "chat":

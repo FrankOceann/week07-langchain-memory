@@ -22,6 +22,7 @@ class FakeSearchHit:
 class FakeMilvusClient:
     def __init__(self):
         self.upsert_calls = []
+        self.delete_calls = []
         self.search_calls = []
         self.has_collection_calls = []
 
@@ -31,6 +32,9 @@ class FakeMilvusClient:
 
     def upsert(self, collection_name: str, data: list[dict]):
         self.upsert_calls.append((collection_name, data))
+
+    def delete(self, collection_name: str, ids: list[int]):
+        self.delete_calls.append((collection_name, ids))
 
     def search(
         self,
@@ -70,6 +74,26 @@ def test_vector_index_upserts_memory_id_as_primary_key():
                     "embedding": vector,
                 }
             ],
+        )
+    ]
+
+
+def test_vector_index_deletes_memory_by_primary_key():
+    client = FakeMilvusClient()
+    vector_index = MilvusMemoryVectorIndex(
+        client=client,
+        collection_name="long_term_memory_vectors",
+    )
+
+    vector_index.delete(memory_id=101)
+
+    assert client.has_collection_calls == [
+        "long_term_memory_vectors",
+    ]
+    assert client.delete_calls == [
+        (
+            "long_term_memory_vectors",
+            [101],
         )
     ]
 

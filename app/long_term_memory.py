@@ -2,7 +2,12 @@ from collections.abc import Callable
 
 from sqlalchemy import select
 
-from app.models import LongTermMemory
+from app.models import (
+    LongTermMemory,
+    MemoryOutbox,
+    OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+    OUTBOX_STATUS_PENDING,
+)
 
 
 ALLOWED_CATEGORIES = {"preference", "profile", "fact"}
@@ -35,6 +40,14 @@ class SQLAlchemyLongTermMemoryRepository:
                 source=source,
             )
             session.add(memory)
+            session.flush()
+
+            event = MemoryOutbox(
+                memory_id=memory.id,
+                event_type=OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+                status=OUTBOX_STATUS_PENDING,
+            )
+            session.add(event)
             session.commit()
             session.refresh(memory)
 
@@ -89,6 +102,13 @@ class SQLAlchemyLongTermMemoryRepository:
         with self.session_factory() as session:
             return list(session.scalars(statement))
 
+    def get_by_id(
+        self,
+        memory_id: int,
+    ) -> LongTermMemory | None:
+        with self.session_factory() as session:
+            return session.get(LongTermMemory, memory_id)
+
     def deactivate(self, memory_id: int) -> bool:
         with self.session_factory() as session:
             memory = session.get(LongTermMemory, memory_id)
@@ -97,6 +117,13 @@ class SQLAlchemyLongTermMemoryRepository:
                 return False
 
             memory.is_active = False
+
+            event = MemoryOutbox(
+                memory_id=memory.id,
+                event_type=OUTBOX_EVENT_MEMORY_INDEX_REQUESTED,
+                status=OUTBOX_STATUS_PENDING,
+            )
+            session.add(event)
             session.commit()
 
             return True
