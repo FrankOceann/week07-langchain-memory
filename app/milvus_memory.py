@@ -1,5 +1,5 @@
 import os
-
+from collections.abc import Callable
 from dotenv import load_dotenv
 from pymilvus import DataType, MilvusClient
 EMBEDDING_DIMENSION = 1024
@@ -30,9 +30,28 @@ class MilvusMemoryVectorIndex:
         self,
         client,
         collection_name: str,
+        client_factory: Callable[[], MilvusClient] | None = None,
     ):
-        self.client = client
+        if client is None and client_factory is None:
+            raise ValueError(
+                "必须提供 Milvus client 或 client_factory。"
+            )
+
+        if client is not None and client_factory is not None:
+            raise ValueError(
+                "不能同时提供 Milvus client 和 client_factory。"
+            )
+
+        self._client = client
+        self._client_factory = client_factory
         self.collection_name = collection_name
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = self._client_factory()
+
+        return self._client
 
     def ensure_collection(self) -> None:
         if self.client.has_collection(

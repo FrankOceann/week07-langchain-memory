@@ -244,9 +244,10 @@ def main(argv: list[str] | None = None) -> int:
 
                 if args.outbox_command == "drain":
                     vector_index = MilvusMemoryVectorIndex(
-                        client=build_milvus_client(),
+                        client=None,
+                        client_factory=build_milvus_client,
                         collection_name="long_term_memory_vectors",
-                    )
+)
                     memory_sync_service = MemorySyncService(
                         embeddings=DashScopeEmbeddings(),
                         vector_index=vector_index,

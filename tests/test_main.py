@@ -98,6 +98,72 @@ def test_memory_outbox_retry_failed_parses_all_flag():
     ) == ("memory", "outbox", "retry-failed", True)
 
 
+def test_outbox_drain_defers_milvus_connection_until_worker_runs(
+    monkeypatch,
+    capsys,
+):
+    class FakeOutboxWorker:
+        def __init__(self, **kwargs):
+            pass
+
+        def drain(self, limit):
+            assert limit == 10
+            return {
+                "succeeded": 0,
+                "retrying": 0,
+                "failed": 0,
+            }
+
+    def unavailable_milvus_client():
+        raise AssertionError(
+            "组装 Outbox worker 时不应连接 Milvus。"
+        )
+
+    monkeypatch.setattr(
+        main_module,
+        "build_session_factory",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "SQLAlchemyLongTermMemoryRepository",
+        lambda session_factory: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "MemoryOutboxRepository",
+        lambda session_factory: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "DashScopeEmbeddings",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "MemorySyncService",
+        lambda embeddings, vector_index: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "MemoryOutboxWorker",
+        FakeOutboxWorker,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_milvus_client",
+        unavailable_milvus_client,
+    )
+
+    exit_code = main_module.main(
+        ["memory", "outbox", "drain"]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        "索引任务处理结果：成功 0，重试 0，失败 0\n"
+    )
+
 def test_memory_outbox_drain_runs_worker(capsys):
     class RecordingOutboxWorker:
         def __init__(self):

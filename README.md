@@ -54,7 +54,7 @@ MILVUS_URI=http://127.0.0.1:19530
 .venv\Scripts\python.exe main.py chat --session-id demo-session --user-id frank
 ```
 
-当前完整离线测试基线为 **61 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
+当前完整离线测试基线为 **62 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
 
 ## 第一节：LangChain Retriever
 
@@ -386,10 +386,11 @@ Milvus collection 名称为 `long_term_memory_vectors`，包含以下字段：
 | `failed` | 已连续失败 3 次，等待人工补偿。 |
 
 - MySQL 记忆变更与 Outbox 事件在同一事务提交，因此不会再出现“记忆已保存但没有任何可重试索引任务”的缺口。
+- Milvus 客户端采用惰性创建：worker 先认领 Outbox 任务，再在处理任务时连接 Milvus。连接失败会被记录为可重试任务，而不会在 CLI 组装阶段直接中断。
 - Outbox 是 at-least-once 投递：同一任务可能被重复执行。Milvus 使用 `memory_id` 主键 upsert，delete 也按该 ID 执行，因此重复操作安全。
 - 第 1、2 次失败分别延迟 1、2 秒后重试；第 3 次失败进入 `failed`。租约到期的 `processing` 事件可被新 worker 重新认领。
 - `memory outbox retry-failed --all` 只把失败事件重新排队；之后运行 `drain` 才会真正访问 Embedding 与 Milvus。
-- 本节离线测试已验证状态机、幂等目标操作和 CLI 装配；真实 MySQL/Milvus 验收需在不展示私有 `.env` 的前提下另行执行。
+- 离线测试已验证状态机、幂等目标操作、CLI 装配，以及“组装 worker 时不提前连接 Milvus”的回归场景。本机已完成真实 MySQL/Milvus 验收：新增索引、停用删除、Milvus 故障后的 3 次重试、失败任务人工补偿与恢复成功；全程未展示私有 `.env`。
 
 ### 本机验收（Windows CMD）
 
