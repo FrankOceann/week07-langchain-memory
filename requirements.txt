@@ -10,3 +10,5 @@ SQLAlchemy
 alembic
 PyMySQL
 pymilvus==3.0.1
+langgraph
+langgraph-checkpoint-sqlite

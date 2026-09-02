@@ -7,11 +7,8 @@ from app.milvus_memory import MilvusMemoryVectorIndex, build_milvus_client
 from app.outbox import MemoryOutboxRepository, MemoryOutboxWorker
 from sqlalchemy.exc import SQLAlchemyError
 from app.semantic_memory import SemanticLongTermMemoryService
-from app.chat import (
-    ask_question,
-    build_chat_model,
-    build_conversation_runnable,
-)
+from app.chat import ask_question_with_workflow, build_chat_model
+from app.workflow import build_chat_workflow_graph
 from app.database import build_session_factory
 from app.embeddings import DashScopeEmbeddings
 from app.long_term_memory import (
@@ -20,10 +17,24 @@ from app.long_term_memory import (
 )
 from app.memory import RedisHistoryStore, build_redis_client
 from app.retriever import build_retriever
+import sqlite3
 
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 DATA_DIRECTORY = Path(__file__).parent / "data"
 
+WORKFLOW_CHECKPOINT_PATH = (
+    DATA_DIRECTORY / "workflow-checkpoints.sqlite"
+)
+def build_workflow_checkpointer(
+    checkpoint_path: Path,
+) -> SqliteSaver:
+    return SqliteSaver(
+        sqlite3.connect(
+            str(checkpoint_path),
+            check_same_thread=False,
+        )
+    )
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -175,10 +186,6 @@ def run_chat_command(
         max_turns=3,
         ttl_seconds=1800,
     )
-    conversation_runnable = build_conversation_runnable(
-        build_chat_model(),
-        history_store,
-    )
 
     vector_index = MilvusMemoryVectorIndex(
         client=build_milvus_client(),
@@ -188,6 +195,15 @@ def run_chat_command(
         embeddings=embeddings,
         vector_index=vector_index,
         long_term_memory_repository=repository,
+    )
+    workflow_graph = build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=retriever,
+        semantic_memory_service=semantic_memory_service,
+        chat_model=build_chat_model(),
+        checkpointer=build_workflow_checkpointer(
+            WORKFLOW_CHECKPOINT_PATH
+        ),
     )
 
     print(f"当前会话：{args.session_id}")
@@ -209,13 +225,11 @@ def run_chat_command(
             print(f"错误：{error}")
             continue
 
-        answer, sources = ask_question(
+        answer, sources = ask_question_with_workflow(
             question,
             session_id=args.session_id,
             user_id=args.user_id,
-            retriever=retriever,
-            conversation_runnable=conversation_runnable,
-            semantic_memory_service=semantic_memory_service,
+            workflow_graph=workflow_graph,
         )
 
         print(f"助手：{answer}")

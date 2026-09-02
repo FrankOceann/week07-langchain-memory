@@ -4,8 +4,10 @@ from main import (
     build_parser,
     run_chat_command,
     run_memory_command,
+    build_workflow_checkpointer,
 )
 import main as main_module
+from app.workflow import build_minimal_graph
 
 def test_chat_command_requires_session_id_and_user_id():
     parser = build_parser()
@@ -446,25 +448,42 @@ def test_memory_add_succeeds_when_sync_service_is_unavailable(capsys):
     )
     assert captured.err == ""
 
-def test_chat_command_passes_semantic_memory_service_to_question(
-    monkeypatch,
-):
+
+def test_build_workflow_checkpointer_creates_sqlite_database(tmp_path):
+    checkpoint_path = tmp_path / "workflow-checkpoints.sqlite"
+
+    checkpointer = build_workflow_checkpointer(checkpoint_path)
+
+    try:
+        checkpointer.setup()
+        tables = {
+            row[0]
+            for row in checkpointer.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        checkpointer.conn.close()
+
+    assert checkpoint_path.exists()
+    assert {"checkpoints", "writes"} <= tables
+def test_chat_command_uses_workflow_adapter(monkeypatch, capsys):
     args = SimpleNamespace(
         session_id="session-a",
         user_id="frank",
     )
-    repository = object()
     captured = {}
     questions = iter(["如何确认副作用操作？", "exit"])
+    workflow_graph = object()
+    checkpointer = object()
 
     class FakeEmbeddings:
         pass
 
     class FakeVectorIndex:
         def __init__(self, client, collection_name):
-            captured["vector_index"] = self
-            captured["vector_index_client"] = client
-            captured["collection_name"] = collection_name
+            self.client = client
+            self.collection_name = collection_name
 
     class FakeSemanticMemoryService:
         def __init__(
@@ -473,17 +492,18 @@ def test_chat_command_passes_semantic_memory_service_to_question(
             vector_index,
             long_term_memory_repository,
         ):
-            captured["created_semantic_memory_service"] = self
-            captured["semantic_embeddings"] = embeddings
-            captured["semantic_vector_index"] = vector_index
-            captured["semantic_repository"] = (
-                long_term_memory_repository
-            )
+            self.embeddings = embeddings
+            self.vector_index = vector_index
+            self.repository = long_term_memory_repository
 
-    def fake_ask_question(question, **kwargs):
+    def fake_build_workflow(**kwargs):
+        captured["graph_arguments"] = kwargs
+        return workflow_graph
+
+    def fake_ask_with_workflow(question, **kwargs):
         captured["question"] = question
-        captured.update(kwargs)
-        return "假的回答", []
+        captured["adapter_arguments"] = kwargs
+        return "图工作流回答", ["agent_safety.txt#chunk-0"]
 
     monkeypatch.setattr(
         "builtins.input",
@@ -516,11 +536,6 @@ def test_chat_command_passes_semantic_memory_service_to_question(
     )
     monkeypatch.setattr(
         main_module,
-        "build_conversation_runnable",
-        lambda chat_model, history_store: object(),
-    )
-    monkeypatch.setattr(
-        main_module,
         "build_milvus_client",
         lambda: object(),
     )
@@ -533,25 +548,76 @@ def test_chat_command_passes_semantic_memory_service_to_question(
         main_module,
         "SemanticLongTermMemoryService",
         FakeSemanticMemoryService,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_workflow_checkpointer",
+        lambda checkpoint_path: checkpointer,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_chat_workflow_graph",
+        fake_build_workflow,
         raising=False,
     )
     monkeypatch.setattr(
         main_module,
-        "ask_question",
-        fake_ask_question,
+        "ask_question_with_workflow",
+        fake_ask_with_workflow,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_conversation_runnable",
+        lambda chat_model, history_store: (_ for _ in ()).throw(
+            AssertionError("CLI 不应再创建旧对话 Runnable。")
+        ),
+        raising=False,
     )
 
-    exit_code = run_chat_command(args, repository)
+    exit_code = run_chat_command(args, repository=object())
 
     assert exit_code == 0
     assert captured["question"] == "如何确认副作用操作？"
-    assert captured["collection_name"] == "long_term_memory_vectors"
-    assert captured["semantic_repository"] is repository
-    assert (
-        captured["semantic_vector_index"]
-        is captured["vector_index"]
+    assert captured["adapter_arguments"] == {
+        "session_id": "session-a",
+        "user_id": "frank",
+        "workflow_graph": workflow_graph,
+    }
+    assert captured["graph_arguments"]["checkpointer"] is checkpointer
+    assert capsys.readouterr().out == (
+        "当前会话：session-a\n"
+        "当前用户：frank\n"
+        "输入 exit、quit 或 退出，结束对话。\n"
+        "助手：图工作流回答\n"
+        "=== agent_safety.txt#chunk-0 ===\n"
     )
-    assert (
-    captured["semantic_memory_service"]
-    is captured["created_semantic_memory_service"]
-)
+
+def test_sqlite_checkpointer_restores_state_after_reopen(tmp_path):
+    checkpoint_path = tmp_path / "workflow-checkpoints.sqlite"
+    config = {"configurable": {"thread_id": "restart-test"}}
+
+    first_checkpointer = build_workflow_checkpointer(checkpoint_path)
+    try:
+        first_graph = build_minimal_graph(first_checkpointer)
+        first_graph.invoke(
+            {"question": "第一轮问题"},
+            config=config,
+        )
+    finally:
+        first_checkpointer.conn.close()
+
+    second_checkpointer = build_workflow_checkpointer(checkpoint_path)
+    try:
+        second_graph = build_minimal_graph(second_checkpointer)
+        result = second_graph.invoke(
+            {"question": "第二轮问题"},
+            config=config,
+        )
+    finally:
+        second_checkpointer.conn.close()
+
+    assert result["completed_questions"] == [
+        "第一轮问题",
+        "第二轮问题",
+    ]

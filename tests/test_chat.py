@@ -5,12 +5,12 @@ from langchain_core.runnables import RunnableLambda
 import pytest
 import fakeredis
 from app.chat import (
-    ask_question,
     build_chat_model,
-    build_conversation_runnable,
+    ask_question_with_workflow,
 )
 from app.memory import RedisHistoryStore
-
+from langgraph.checkpoint.memory import InMemorySaver
+from app.workflow import build_chat_workflow_graph
 
 class FakeRetriever:
     def invoke(self, question: str) -> list[Document]:
@@ -51,100 +51,47 @@ class FakeSemanticLongTermMemoryService:
         return []
 
 
-def test_same_session_includes_previous_turn_and_preserves_sources():
-    received_prompts = []
-
-    def fake_response(prompt_value):
-        received_prompts.append(prompt_value.messages)
-        return AIMessage(content="假的回答")
-
-    conversation_runnable = build_conversation_runnable(
-        RunnableLambda(fake_response),
-        RedisHistoryStore(
-            fakeredis.FakeRedis(decode_responses=True),
-            max_turns=3,
-            ttl_seconds=30,
-        ),
-    )
-    semantic_memory_service = FakeSemanticLongTermMemoryService()
-
-    first_answer, first_sources = ask_question(
-        "如何确认副作用操作？",
-        session_id="session-a",
-        user_id="existing-user",
-        retriever=FakeRetriever(),
-        conversation_runnable=conversation_runnable,
-        semantic_memory_service=semantic_memory_service,
-    )
-    second_answer, second_sources = ask_question(
-        "那为什么？",
-        session_id="session-a",
-        user_id="existing-user",
-        retriever=FakeRetriever(),
-        conversation_runnable=conversation_runnable,
-        semantic_memory_service=semantic_memory_service,
-    )
-
-    second_prompt_text = "\n".join(
-    message.content for message in received_prompts[1]
-    )
-
-    assert first_answer == "假的回答"
-    assert second_answer == "假的回答"
-    assert first_sources == ["agent_safety.txt#chunk-0"]
-    assert second_sources == ["agent_safety.txt#chunk-0"]
-    assert "如何确认副作用操作？" in second_prompt_text
-    assert "假的回答" in second_prompt_text
-    assert "确认副作用前必须征得用户同意。" in second_prompt_text
-
 def test_build_chat_model_rejects_missing_api_key(monkeypatch):
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
     with pytest.raises(ValueError, match="DASHSCOPE_API_KEY"):
         build_chat_model(api_key="")
 
-def test_chat_includes_current_users_long_term_memories():
-    received_prompts = []
+def test_workflow_adapter_returns_answer_sources_and_saves_history():
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
 
     def fake_response(prompt_value):
-        received_prompts.append(prompt_value.messages)
-        return AIMessage(content="假的回答")
+        return AIMessage(content="图工作流回答")
 
-    semantic_memory_service = FakeSemanticLongTermMemoryService()
-    conversation_runnable = build_conversation_runnable(
-        RunnableLambda(fake_response),
-        RedisHistoryStore(
-            fakeredis.FakeRedis(decode_responses=True),
-            max_turns=3,
-            ttl_seconds=30,
-        ),
+    graph = build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticLongTermMemoryService(),
+        chat_model=RunnableLambda(fake_response),
+        checkpointer=InMemorySaver(),
     )
 
-    answer, sources = ask_question(
-        "如何确认副作用操作？",
+    answer, sources = ask_question_with_workflow(
+        question="如何确认副作用操作？",
         session_id="session-a",
         user_id="frank",
-        retriever=FakeRetriever(),
-        conversation_runnable=conversation_runnable,
-        semantic_memory_service=semantic_memory_service,
+        workflow_graph=graph,
     )
 
-    prompt_text = "\n".join(
-        message.content for message in received_prompts[0]
-    )
+    messages = history_store.get("session-a").messages
 
-    assert answer == "假的回答"
+    assert answer == "图工作流回答"
     assert sources == ["agent_safety.txt#chunk-0"]
-    assert semantic_memory_service.search_calls == [
-    {
-        "user_id": "frank",
-        "question": "如何确认副作用操作？",
-        "limit": 3,
-    }
-]
-    assert "[memory:101] (preference) 使用中文回答。" in prompt_text
+    assert [message.content for message in messages] == [
+        "如何确认副作用操作？",
+        "图工作流回答",
+    ]
 
-def test_long_term_memory_failure_does_not_call_chat_model():
+def test_workflow_adapter_raises_error_without_saving_history():
     class FailingSemanticMemoryService:
         def search_active(
             self,
@@ -152,26 +99,32 @@ def test_long_term_memory_failure_does_not_call_chat_model():
             question: str,
             limit: int = 3,
         ):
-            raise ConnectionError("MySQL 不可用")
+            raise ConnectionError("long-term memory unavailable")
 
-    class RecordingConversationRunnable:
-        def __init__(self):
-            self.calls = 0
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    graph = build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=FakeRetriever(),
+        semantic_memory_service=FailingSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="不应生成")
+        ),
+        checkpointer=InMemorySaver(),
+    )
 
-        def invoke(self, values, config):
-            self.calls += 1
-            return AIMessage(content="不应生成")
-
-    conversation_runnable = RecordingConversationRunnable()
-
-    with pytest.raises(ConnectionError, match="MySQL 不可用"):
-        ask_question(
-            "如何确认副作用操作？",
+    with pytest.raises(
+        RuntimeError,
+        match="ConnectionError: long-term memory unavailable",
+    ):
+        ask_question_with_workflow(
+            question="如何确认副作用操作？",
             session_id="session-a",
             user_id="frank",
-            retriever=FakeRetriever(),
-            conversation_runnable=conversation_runnable,
-            semantic_memory_service=FailingSemanticMemoryService(),
+            workflow_graph=graph,
         )
 
-    assert conversation_runnable.calls == 0
+    assert history_store.get("session-a").messages == []
