@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+from app.conversation import build_workflow_thread_id
 from app.embeddings import DEFAULT_BASE_URL
 def build_chat_model(api_key: str | None = None) -> ChatOpenAI:
     load_dotenv()
@@ -38,7 +39,10 @@ def ask_question_with_workflow(
         },
         config={
             "configurable": {
-                "thread_id": f"week08:{user_id}:{session_id}",
+                "thread_id": build_workflow_thread_id(
+                    user_id,
+                    session_id,
+                ),
             }
         },
     )

@@ -1,4 +1,5 @@
 from typing import TypedDict
+from app.conversation import build_conversation_key
 from app.long_term_memory import render_long_term_memories
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -515,11 +516,30 @@ def build_chat_workflow_graph(
     def load_short_history(
         state: ChatWorkflowState,
     ) -> ChatWorkflowState:
-        history = history_store.get(state["session_id"])
+        try:
+            history = history_store.get(
+                build_conversation_key(
+                    state["user_id"],
+                    state["session_id"],
+                )
+            )
+        except Exception as error:
+            return {
+                "error": f"{type(error).__name__}: {error}"
+            }
 
         return {
             "history": history.messages,
+            "error": None,
         }
+
+    def route_after_history_load(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["error"] is not None:
+            return "end"
+
+        return "retrieve"
 
     def retrieve_rag(
         state: ChatWorkflowState,
@@ -624,13 +644,23 @@ def build_chat_workflow_graph(
     def save_short_history(
         state: ChatWorkflowState,
     ) -> ChatWorkflowState:
-        history = history_store.get(state["session_id"])
-        history.add_messages(
-            [
-                HumanMessage(content=state["question"]),
-                AIMessage(content=state["answer"]),
-            ]
-        )
+        try:
+            history = history_store.get(
+                build_conversation_key(
+                    state["user_id"],
+                    state["session_id"],
+                )
+            )
+            history.add_messages(
+                [
+                    HumanMessage(content=state["question"]),
+                    AIMessage(content=state["answer"]),
+                ]
+            )
+        except Exception as error:
+            return {
+                "error": f"{type(error).__name__}: {error}"
+            }
 
         return {}
 
@@ -646,7 +676,14 @@ def build_chat_workflow_graph(
     builder.add_node("save_short_history", save_short_history)
 
     builder.add_edge(START, "load_short_history")
-    builder.add_edge("load_short_history", "retrieve_rag")
+    builder.add_conditional_edges(
+        "load_short_history",
+        route_after_history_load,
+        {
+            "end": END,
+            "retrieve": "retrieve_rag",
+        },
+    )
     builder.add_conditional_edges(
         "retrieve_rag",
         route_after_retrieval,

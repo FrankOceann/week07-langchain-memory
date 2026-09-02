@@ -1,23 +1,28 @@
-# Week07 LangChain Memory
+# Week08 LangGraph RAG + Memory
 
-> 当前可运行版本已完成 Redis 短期记忆、MySQL 权威长期记忆、Milvus 语义召回，以及 MySQL Outbox 异步索引同步。下方各节保留阶段学习记录；实际运行请优先使用本节的“当前系统运行手册”。
+> 当前可运行版本已迁移至 LangGraph：保留 Redis 短期记忆、MySQL 权威长期记忆、Milvus 语义召回与 MySQL Outbox 异步索引同步，并增加显式工作流状态、SQLite checkpoint、错误短路和人工审批示例。下方各节保留阶段学习记录；实际运行请优先使用本节的“当前系统运行手册”。
 
 ## 当前系统与运行手册
 
-当前项目是一个本地 CLI 形式的 RAG + Memory 学习闭环。它将三种状态明确分开：
+当前项目是一个本地 CLI 形式的 RAG + Memory 学习闭环。主聊天路径由 LangGraph 编排，并将状态边界明确分开：
 
 ```text
-用户问题
-  -> Redis：按 session_id 读取最近 3 轮短期对话
-  -> 本地 RAG Retriever：重新检索本轮资料 Top-3
-  -> Milvus：按 user_id 做语义搜索，返回长期记忆候选 ID
-  -> MySQL：验证候选记录的 user_id 与 is_active，并读取权威正文
-  -> Chat 模型：使用资料作为事实依据、使用有效长期记忆作个性化参考
+START
+  -> load_short_history：Redis 读取最近 3 轮短期对话
+  -> retrieve_rag：本地 RAG Retriever 重新检索本轮资料 Top-3
+  -> load_long_term_memory：Milvus 按 user_id 召回候选 ID，MySQL 回读并验证权威正文
+  -> generate_answer：资料作为事实依据，长期记忆仅作个性化参考
+  -> save_short_history：Redis 写入本轮用户/助手消息
+  -> END
+
+任一节点发生错误 -> END；不会继续调用后续节点，也不会在失败后写入短期历史。
 ```
 
 | 组件 | 边界 | 当前职责 |
 | --- | --- | --- |
-| Redis | `session_id` | 保存最近 3 个问答轮，30 分钟滑动 TTL。 |
+| LangGraph | `ChatWorkflowState` + 条件边 | 显式编排历史、检索、长期记忆、模型与保存；错误状态立即短路。 |
+| SQLite Checkpointer | 无歧义 `thread_id` | 持久化 LangGraph 状态；启用 WAL 与 5 秒锁等待，支持安全重开。 |
+| Redis | `(user_id, session_id)` 复合键 | 保存最近 3 个问答轮，30 分钟滑动 TTL；相同会话 ID 的不同用户不共享历史。 |
 | MySQL | `user_id`、`memory_id`、Outbox 事件 | 长期记忆权威来源；负责内容、类别、软停用状态及待索引任务。 |
 | Milvus | `user_id` 过滤 + `memory_id` | 只保存向量索引和候选 ID，不作为长期记忆的权威来源。 |
 | 本地 RAG 资料 | `source` | 每轮回答的事实依据；默认检索 Top-3。 |
@@ -54,7 +59,21 @@ MILVUS_URI=http://127.0.0.1:19530
 .venv\Scripts\python.exe main.py chat --session-id demo-session --user-id frank
 ```
 
-当前完整离线测试基线为 **62 passed, 2 warnings**。两条 warning 来自 `RunnableWithMessageHistory` 的 LangChain 弃用提示；它将在后续 LangGraph 专题中迁移。离线测试不会调用真实 API Key，也不需要 Docker 服务。
+### Week08 工作流行为
+
+- `app/workflow.py` 中的 `build_chat_workflow_graph()` 是实际聊天图；CLI 不再创建 `RunnableWithMessageHistory`。
+- `app/conversation.py` 将 `(user_id, session_id)` 编码为无歧义 JSON 数组。它既是 Redis 历史的作用域，也用于构造 LangGraph `thread_id`，避免冒号等合法输入造成碰撞。
+- `main.py` 使用 `data/workflow-checkpoints.sqlite` 保存 checkpoint。该文件及其 WAL/SHM 伴随文件已被 `.gitignore` 忽略；不要把真实对话 checkpoint 提交到仓库。
+- RAG、长期记忆、模型或 Redis 读取失败时，CLI 会显示 `错误：...` 并允许继续提问；失败轮次不会写入 Redis。
+- `build_minimal_graph()` 演示 `interrupt()` 人工审批：状态停在 checkpoint 后，只能由 `Command("approved")` 或 `Command("rejected")` 恢复。
+
+### Week08 离线验证
+
+```cmd
+.venv\Scripts\python.exe -m pytest -q
+```
+
+当前完整离线测试基线为 **90 passed**。测试使用 Fake Redis、Fake Retriever、Fake Chat Model 和临时 SQLite 文件；不读取真实 API Key，也不需要 Docker 服务。
 
 ## 第一节：LangChain Retriever
 

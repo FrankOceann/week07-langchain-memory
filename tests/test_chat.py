@@ -11,6 +11,7 @@ from app.chat import (
 from app.memory import RedisHistoryStore
 from langgraph.checkpoint.memory import InMemorySaver
 from app.workflow import build_chat_workflow_graph
+from app.conversation import build_conversation_key
 
 class FakeRetriever:
     def invoke(self, question: str) -> list[Document]:
@@ -82,7 +83,9 @@ def test_workflow_adapter_returns_answer_sources_and_saves_history():
         workflow_graph=graph,
     )
 
-    messages = history_store.get("session-a").messages
+    messages = history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).messages
 
     assert answer == "图工作流回答"
     assert sources == ["agent_safety.txt#chunk-0"]
@@ -128,3 +131,27 @@ def test_workflow_adapter_raises_error_without_saving_history():
         )
 
     assert history_store.get("session-a").messages == []
+
+
+def test_workflow_adapter_uses_unambiguous_thread_id():
+    captured = {}
+
+    class FakeGraph:
+        def invoke(self, state, config):
+            captured["config"] = config
+            return {
+                "answer": "图工作流回答",
+                "sources": [],
+                "error": None,
+            }
+
+    ask_question_with_workflow(
+        question="问题",
+        session_id="b:c",
+        user_id="a",
+        workflow_graph=FakeGraph(),
+    )
+
+    assert captured["config"] == {
+        "configurable": {"thread_id": 'week08:["a","b:c"]'}
+    }

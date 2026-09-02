@@ -29,12 +29,15 @@ WORKFLOW_CHECKPOINT_PATH = (
 def build_workflow_checkpointer(
     checkpoint_path: Path,
 ) -> SqliteSaver:
-    return SqliteSaver(
-        sqlite3.connect(
-            str(checkpoint_path),
-            check_same_thread=False,
-        )
+    connection = sqlite3.connect(
+        str(checkpoint_path),
+        check_same_thread=False,
+        timeout=5,
     )
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=5000")
+
+    return SqliteSaver(connection)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -196,46 +199,56 @@ def run_chat_command(
         vector_index=vector_index,
         long_term_memory_repository=repository,
     )
-    workflow_graph = build_chat_workflow_graph(
-        history_store=history_store,
-        retriever=retriever,
-        semantic_memory_service=semantic_memory_service,
-        chat_model=build_chat_model(),
-        checkpointer=build_workflow_checkpointer(
-            WORKFLOW_CHECKPOINT_PATH
-        ),
+    checkpointer = build_workflow_checkpointer(
+        WORKFLOW_CHECKPOINT_PATH
     )
-
-    print(f"当前会话：{args.session_id}")
-    print(f"当前用户：{args.user_id}")
-    print("输入 exit、quit 或 退出，结束对话。")
-
-    while True:
-        try:
-            raw_question = input("你：")
-        except EOFError:
-            return 0
-
-        if raw_question.strip().lower() in {"exit", "quit", "退出"}:
-            return 0
-
-        try:
-            question = validate_question(raw_question)
-        except ValueError as error:
-            print(f"错误：{error}")
-            continue
-
-        answer, sources = ask_question_with_workflow(
-            question,
-            session_id=args.session_id,
-            user_id=args.user_id,
-            workflow_graph=workflow_graph,
+    try:
+        workflow_graph = build_chat_workflow_graph(
+            history_store=history_store,
+            retriever=retriever,
+            semantic_memory_service=semantic_memory_service,
+            chat_model=build_chat_model(),
+            checkpointer=checkpointer,
         )
 
-        print(f"助手：{answer}")
+        print(f"当前会话：{args.session_id}")
+        print(f"当前用户：{args.user_id}")
+        print("输入 exit、quit 或 退出，结束对话。")
 
-        for source in sources:
-            print(f"=== {source} ===")
+        while True:
+            try:
+                raw_question = input("你：")
+            except EOFError:
+                return 0
+
+            if raw_question.strip().lower() in {"exit", "quit", "退出"}:
+                return 0
+
+            try:
+                question = validate_question(raw_question)
+            except ValueError as error:
+                print(f"错误：{error}")
+                continue
+
+            try:
+                answer, sources = ask_question_with_workflow(
+                    question,
+                    session_id=args.session_id,
+                    user_id=args.user_id,
+                    workflow_graph=workflow_graph,
+                )
+            except RuntimeError as error:
+                print(f"错误：{error}")
+                continue
+
+            print(f"助手：{answer}")
+
+            for source in sources:
+                print(f"=== {source} ===")
+    finally:
+        connection = getattr(checkpointer, "conn", None)
+        if connection is not None:
+            connection.close()
 
 
 def main(argv: list[str] | None = None) -> int:

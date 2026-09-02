@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 import fakeredis
 from app.memory import RedisHistoryStore
+from app.conversation import build_conversation_key
 
 def test_workflow_processes_nonempty_question():
     graph = build_minimal_graph(InMemorySaver())
@@ -524,7 +525,9 @@ def test_chat_workflow_graph_runs_rag_memory_and_redis_history():
         max_turns=3,
         ttl_seconds=30,
     )
-    history_store.get("session-a").add_messages(
+    history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).add_messages(
         [
             HumanMessage(content="上一轮问题"),
             AIMessage(content="上一轮回答"),
@@ -556,7 +559,9 @@ def test_chat_workflow_graph_runs_rag_memory_and_redis_history():
         message.content
         for message in received_prompts[0]
     )
-    messages = history_store.get("session-a").messages
+    messages = history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).messages
 
     assert result["answer"] == "假的回答"
     assert result["sources"] == [
@@ -646,3 +651,108 @@ def test_chat_workflow_graph_does_not_save_history_after_model_error():
         "ConnectionError: chat model unavailable"
     )
     assert history_store.get("session-a").messages == []
+
+
+def test_chat_workflow_graph_isolates_same_session_id_between_users():
+    received_prompts = []
+
+    def fake_response(prompt_value):
+        received_prompts.append(prompt_value.messages)
+        return AIMessage(content="假的回答")
+
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(fake_response),
+        checkpointer=InMemorySaver(),
+    )
+
+    for user_id, question in [
+        ("alice", "Alice 的私密问题"),
+        ("bob", "Bob 的独立问题"),
+    ]:
+        graph.invoke(
+            {
+                "session_id": "shared-session",
+                "user_id": user_id,
+                "question": question,
+            },
+            config={"configurable": {"thread_id": user_id}},
+        )
+
+    bob_prompt = "\n".join(
+        message.content for message in received_prompts[1]
+    )
+
+    assert "Alice 的私密问题" not in bob_prompt
+    assert "Bob 的独立问题" in bob_prompt
+
+
+def test_chat_workflow_graph_stops_before_model_and_redis_on_retrieval_error():
+    class FailingRetriever:
+        def invoke(self, question: str):
+            raise ConnectionError("retriever unavailable")
+
+    chat_calls = []
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=FailingRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: chat_calls.append(prompt_value)
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "retrieval-error"}},
+    )
+
+    assert result["error"] == "ConnectionError: retriever unavailable"
+    assert chat_calls == []
+    assert history_store.get("session-a").messages == []
+
+
+def test_chat_workflow_graph_stops_when_redis_history_load_fails():
+    class FailingHistoryStore:
+        def get(self, key: str):
+            raise ConnectionError("redis unavailable")
+
+    chat_calls = []
+    graph = workflow.build_chat_workflow_graph(
+        history_store=FailingHistoryStore(),
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: chat_calls.append(prompt_value)
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "history-error"}},
+    )
+
+    assert result["error"] == "ConnectionError: redis unavailable"
+    assert chat_calls == []

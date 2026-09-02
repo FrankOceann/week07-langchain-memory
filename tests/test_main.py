@@ -621,3 +621,61 @@ def test_sqlite_checkpointer_restores_state_after_reopen(tmp_path):
         "第一轮问题",
         "第二轮问题",
     ]
+
+
+def test_build_workflow_checkpointer_configures_wal_and_busy_timeout(tmp_path):
+    checkpointer = build_workflow_checkpointer(
+        tmp_path / "workflow-checkpoints.sqlite"
+    )
+
+    try:
+        journal_mode = checkpointer.conn.execute(
+            "PRAGMA journal_mode"
+        ).fetchone()[0]
+        busy_timeout = checkpointer.conn.execute(
+            "PRAGMA busy_timeout"
+        ).fetchone()[0]
+    finally:
+        checkpointer.conn.close()
+
+    assert journal_mode.lower() == "wal"
+    assert busy_timeout == 5000
+
+
+def test_chat_command_reports_workflow_error_and_continues(monkeypatch, capsys):
+    args = SimpleNamespace(session_id="session-a", user_id="frank")
+    questions = iter(["会失败的问题", "exit"])
+
+    monkeypatch.setattr("builtins.input", lambda prompt: next(questions))
+    monkeypatch.setattr(main_module, "DashScopeEmbeddings", lambda: object())
+    monkeypatch.setattr(main_module, "build_retriever", lambda *args: object())
+    monkeypatch.setattr(main_module, "build_redis_client", lambda: object())
+    monkeypatch.setattr(
+        main_module, "RedisHistoryStore", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(main_module, "build_milvus_client", lambda: object())
+    monkeypatch.setattr(
+        main_module, "MilvusMemoryVectorIndex", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        main_module, "SemanticLongTermMemoryService", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(main_module, "build_chat_model", lambda: object())
+    monkeypatch.setattr(
+        main_module, "build_workflow_checkpointer", lambda path: object()
+    )
+    monkeypatch.setattr(
+        main_module, "build_chat_workflow_graph", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(
+        main_module,
+        "ask_question_with_workflow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("ConnectionError: retriever unavailable")
+        ),
+    )
+
+    assert run_chat_command(args, repository=object()) == 0
+    assert "错误：ConnectionError: retriever unavailable" in (
+        capsys.readouterr().out
+    )
