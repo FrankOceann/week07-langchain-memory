@@ -26,6 +26,142 @@ def test_chat_command_requires_session_id_and_user_id():
     )
 
 
+def test_workflow_inspect_prints_safe_checkpoint_summary(monkeypatch, capsys):
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeWorkflowGraph:
+        def get_state(self, config):
+            return SimpleNamespace(
+                values={
+                    "question": "如何确认副作用操作？",
+                    "sources": ["agent_safety.txt#chunk-0"],
+                    "error": "ConnectionError: retriever unavailable",
+                    "pending_action": {
+                        "action": "send_notification",
+                        "message": "绝密通知正文",
+                        "impact": "向模拟外部通知服务发送一条消息",
+                        "cancellable": True,
+                    },
+                },
+                next=("request_notification_approval",),
+                config={"configurable": {"checkpoint_id": "current-id"}},
+                metadata={"step": 5},
+            )
+
+        def get_state_history(self, config):
+            return iter(
+                [
+                    SimpleNamespace(
+                        next=("rag_answer_subgraph",),
+                        metadata={"step": 3},
+                        config={
+                            "configurable": {"checkpoint_id": "old-id"}
+                        },
+                    ),
+                    SimpleNamespace(
+                        next=("request_notification_approval",),
+                        metadata={"step": 5},
+                        config={
+                            "configurable": {"checkpoint_id": "current-id"}
+                        },
+                    ),
+                ]
+            )
+
+    connection = FakeConnection()
+    checkpointer = SimpleNamespace(conn=connection)
+    monkeypatch.setattr(
+        main_module,
+        "build_workflow_checkpointer",
+        lambda checkpoint_path: checkpointer,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_chat_workflow_inspector",
+        lambda current_checkpointer: FakeWorkflowGraph(),
+        raising=False,
+    )
+
+    assert main_module.run_workflow_inspect_command(
+        SimpleNamespace(session_id="session-a", user_id="frank")
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "当前 checkpoint：current-id" in output
+    assert "下一节点：request_notification_approval" in output
+    assert "检索来源：agent_safety.txt#chunk-0" in output
+    assert "待审批动作：send_notification" in output
+    assert "影响范围：向模拟外部通知服务发送一条消息" in output
+    assert "历史步骤：3 -> rag_answer_subgraph (old-id)" in output
+    assert "绝密通知正文" not in output
+    assert connection.closed is True
+
+
+def test_workflow_inspect_cli_bypasses_external_services(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        main_module,
+        "run_workflow_inspect_command",
+        lambda args: captured.update(
+            session_id=args.session_id,
+            user_id=args.user_id,
+        )
+        or 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_session_factory",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("检查命令不应创建数据库连接。")
+        ),
+    )
+
+    assert main_module.main(
+        [
+            "workflow",
+            "inspect",
+            "--session-id",
+            "session-a",
+            "--user-id",
+            "frank",
+        ]
+    ) == 0
+    assert captured == {"session_id": "session-a", "user_id": "frank"}
+
+
+def test_workflow_inspect_reports_missing_checkpoint(monkeypatch, capsys):
+    class EmptyWorkflowGraph:
+        def get_state(self, config):
+            return SimpleNamespace(values={})
+
+        def get_state_history(self, config):
+            return iter([])
+
+    checkpointer = SimpleNamespace(conn=SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(
+        main_module,
+        "build_workflow_checkpointer",
+        lambda checkpoint_path: checkpointer,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_chat_workflow_inspector",
+        lambda current_checkpointer: EmptyWorkflowGraph(),
+    )
+
+    assert main_module.run_workflow_inspect_command(
+        SimpleNamespace(session_id="missing-session", user_id="frank")
+    ) == 0
+    assert "未找到该会话的工作流 checkpoint。" in capsys.readouterr().out
+
+
 def test_memory_add_requires_valid_category():
     parser = build_parser()
 
@@ -529,10 +665,11 @@ def test_chat_command_uses_workflow_adapter(monkeypatch, capsys):
         "RedisHistoryStore",
         lambda client, max_turns, ttl_seconds: object(),
     )
+    chat_model = object()
     monkeypatch.setattr(
         main_module,
         "build_chat_model",
-        lambda: object(),
+        lambda: chat_model,
     )
     monkeypatch.setattr(
         main_module,
@@ -585,6 +722,8 @@ def test_chat_command_uses_workflow_adapter(monkeypatch, capsys):
         "workflow_graph": workflow_graph,
     }
     assert captured["graph_arguments"]["checkpointer"] is checkpointer
+    assert captured["graph_arguments"]["query_rewriter"] is chat_model
+    assert captured["graph_arguments"]["query_rewrite_decider"] is chat_model
     assert capsys.readouterr().out == (
         "当前会话：session-a\n"
         "当前用户：frank\n"
@@ -679,3 +818,57 @@ def test_chat_command_reports_workflow_error_and_continues(monkeypatch, capsys):
     assert "错误：ConnectionError: retriever unavailable" in (
         capsys.readouterr().out
     )
+
+
+def test_chat_command_resumes_notification_after_confirm(monkeypatch, capsys):
+    args = SimpleNamespace(session_id="session-a", user_id="frank")
+    inputs = iter(["/notify 项目测试已经完成", "confirm", "exit"])
+    action = {
+        "action": "send_notification",
+        "message": "项目测试已经完成",
+        "impact": "向模拟外部通知服务发送一条消息",
+        "cancellable": True,
+    }
+    captured = {}
+
+    monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+    monkeypatch.setattr(main_module, "DashScopeEmbeddings", lambda: object())
+    monkeypatch.setattr(main_module, "build_retriever", lambda *args: object())
+    monkeypatch.setattr(main_module, "build_redis_client", lambda: object())
+    monkeypatch.setattr(
+        main_module, "RedisHistoryStore", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(main_module, "build_milvus_client", lambda: object())
+    monkeypatch.setattr(
+        main_module, "MilvusMemoryVectorIndex", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        main_module, "SemanticLongTermMemoryService", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(main_module, "build_chat_model", lambda: object())
+    monkeypatch.setattr(
+        main_module, "build_workflow_checkpointer", lambda path: object()
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_chat_workflow_graph",
+        lambda **kwargs: captured.update(graph_arguments=kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "ask_question_with_workflow",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            main_module.WorkflowInterrupted(action)
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "resume_workflow_action",
+        lambda **kwargs: captured.update(resume_arguments=kwargs)
+        or ("已准备发送通知。\n\n操作结果：模拟通知已发送：项目测试已经完成", []),
+        raising=False,
+    )
+
+    assert run_chat_command(args, repository=object()) == 0
+    assert captured["resume_arguments"]["decision"] == "approved"
+    assert "待确认操作：send_notification" in capsys.readouterr().out

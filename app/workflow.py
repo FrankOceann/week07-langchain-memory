@@ -481,19 +481,25 @@ class ChatWorkflowState(TypedDict, total=False):
     user_id: str
     question: str
     history: list
+    should_rewrite: bool
+    retrieval_query: str
+    retrieval_attempts: int
+    retry_retrieval: bool
     context: str
     sources: list[str]
     long_term_memory_context: str
     answer: str
+    pending_action: dict | None
+    approval_decision: str
+    action_status: str
+    action_result: str
     error: str | None
 
 
-def build_chat_workflow_graph(
-    history_store,
+def build_rag_answer_subgraph(
     retriever,
     semantic_memory_service,
     chat_model,
-    checkpointer,
 ):
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -510,6 +516,156 @@ def build_chat_workflow_graph(
                 "\n{long_term_memories}\n\n"
                 "本轮检索资料：\n{context}\n\n当前问题：{question}",
             ),
+        ]
+    )
+
+    def retrieve_rag(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        try:
+            documents = retriever.invoke(state["retrieval_query"])
+        except Exception as error:
+            retrieval_attempts = state.get("retrieval_attempts", 0) + 1
+            return {
+                "error": f"{type(error).__name__}: {error}",
+                "retrieval_attempts": retrieval_attempts,
+                "retry_retrieval": (
+                    isinstance(error, ConnectionError)
+                    and retrieval_attempts <= 1
+                ),
+            }
+
+        sources = [document.metadata["source"] for document in documents]
+        context = "\n\n".join(
+            f"[{document.metadata['source']}]\n{document.page_content}"
+            for document in documents
+        )
+        return {
+            "context": context,
+            "sources": sources,
+            "retry_retrieval": False,
+            "error": None,
+        }
+
+    def route_after_retrieval(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["error"] is not None:
+            if state.get("retry_retrieval", False):
+                return "retry"
+            return "fallback"
+        return "memory"
+
+    def generate_retrieval_fallback(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        return {
+            "answer": "检索服务暂时不可用，请稍后重试。",
+            "sources": [],
+        }
+
+    def load_long_term_memory(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        try:
+            memories = semantic_memory_service.search_active(
+                user_id=state["user_id"],
+                question=state["question"],
+            )
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {error}"}
+
+        return {
+            "long_term_memory_context": render_long_term_memories(memories),
+            "error": None,
+        }
+
+    def route_after_memory(
+        state: ChatWorkflowState,
+    ) -> str:
+        return "end" if state["error"] is not None else "answer"
+
+    def generate_answer(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        try:
+            response = (prompt | chat_model).invoke(
+                {
+                    "history": state["history"],
+                    "question": state["question"],
+                    "context": state["context"],
+                    "long_term_memories": state["long_term_memory_context"],
+                }
+            )
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {error}"}
+
+        return {"answer": response.content, "error": None}
+
+    builder = StateGraph(ChatWorkflowState)
+    builder.add_node("retrieve_rag", retrieve_rag)
+    builder.add_node(
+        "generate_retrieval_fallback",
+        generate_retrieval_fallback,
+    )
+    builder.add_node("load_long_term_memory", load_long_term_memory)
+    builder.add_node("generate_answer", generate_answer)
+    builder.add_edge(START, "retrieve_rag")
+    builder.add_conditional_edges(
+        "retrieve_rag",
+        route_after_retrieval,
+        {
+            "retry": "retrieve_rag",
+            "fallback": "generate_retrieval_fallback",
+            "memory": "load_long_term_memory",
+        },
+    )
+    builder.add_edge("generate_retrieval_fallback", END)
+    builder.add_conditional_edges(
+        "load_long_term_memory",
+        route_after_memory,
+        {"end": END, "answer": "generate_answer"},
+    )
+    builder.add_edge("generate_answer", END)
+    return builder.compile()
+
+
+def build_chat_workflow_inspector(checkpointer):
+    builder = StateGraph(ChatWorkflowState)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def build_chat_workflow_graph(
+    history_store,
+    retriever,
+    semantic_memory_service,
+    chat_model,
+    checkpointer,
+    query_rewriter=None,
+    query_rewrite_decider=None,
+    notification_tool=None,
+):
+    rewrite_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "结合历史对话，将当前问题改写成适合知识库检索的完整问题。"
+                "不要添加历史中不存在的事实；只输出改写后的问题。",
+            ),
+            MessagesPlaceholder("history"),
+            ("human", "当前问题：{question}"),
+        ]
+    )
+    rewrite_decision_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "判断当前问题是否必须结合历史对话改写后才能检索知识库。"
+                "问题完整清晰时输出 KEEP；问题含有指代或省略时输出 REWRITE。"
+                "只输出 KEEP 或 REWRITE。",
+            ),
+            MessagesPlaceholder("history"),
+            ("human", "当前问题：{question}"),
         ]
     )
 
@@ -539,107 +695,202 @@ def build_chat_workflow_graph(
         if state["error"] is not None:
             return "end"
 
-        return "retrieve"
+        return "decision"
 
-    def retrieve_rag(
+    def decide_query_rewrite(
         state: ChatWorkflowState,
     ) -> ChatWorkflowState:
-        try:
-            documents = retriever.invoke(state["question"])
-        except Exception as error:
+        if not state["history"] or query_rewriter is None:
             return {
-                "error": (
-                    f"{type(error).__name__}: {error}"
-                )
+                "should_rewrite": False,
+                "retrieval_query": state["question"],
+                "error": None,
             }
 
-        sources = [
-            document.metadata["source"]
-            for document in documents
-        ]
-        context = "\n\n".join(
-            f"[{document.metadata['source']}]\n"
-            f"{document.page_content}"
-            for document in documents
-        )
+        if query_rewrite_decider is None:
+            return {
+                "should_rewrite": True,
+                "error": None,
+            }
 
-        return {
-            "context": context,
-            "sources": sources,
-            "error": None,
-        }
-
-    def route_after_retrieval(
-        state: ChatWorkflowState,
-    ) -> str:
-        if state["error"] is not None:
-            return "end"
-
-        return "memory"
-
-    def load_long_term_memory(
-        state: ChatWorkflowState,
-    ) -> ChatWorkflowState:
         try:
-            memories = semantic_memory_service.search_active(
-                user_id=state["user_id"],
-                question=state["question"],
+            response = (rewrite_decision_prompt | query_rewrite_decider).invoke(
+                {
+                    "history": state["history"],
+                    "question": state["question"],
+                }
             )
+            decision = response.content.strip().upper()
+            if decision not in {"KEEP", "REWRITE"}:
+                raise ValueError(
+                    "查询改写判断器必须返回 KEEP 或 REWRITE。"
+                )
         except Exception as error:
             return {
-                "error": (
-                    f"{type(error).__name__}: {error}"
-                )
+                "error": f"{type(error).__name__}: {error}"
             }
 
         return {
-            "long_term_memory_context": (
-                render_long_term_memories(memories)
+            "should_rewrite": decision == "REWRITE",
+            "retrieval_query": (
+                state["question"] if decision == "KEEP" else ""
             ),
             "error": None,
         }
 
-    def route_after_memory(
+    def route_after_query_decision(
         state: ChatWorkflowState,
     ) -> str:
         if state["error"] is not None:
             return "end"
 
-        return "answer"
+        if state["should_rewrite"]:
+            return "rewrite"
 
-    def generate_answer(
+        return "rag_answer"
+
+    def rewrite_retrieval_query(
         state: ChatWorkflowState,
     ) -> ChatWorkflowState:
+        if not state["history"] or query_rewriter is None:
+            return {
+                "retrieval_query": state["question"],
+                "error": None,
+            }
+
         try:
-            response = (prompt | chat_model).invoke(
+            response = (rewrite_prompt | query_rewriter).invoke(
                 {
                     "history": state["history"],
                     "question": state["question"],
-                    "context": state["context"],
-                    "long_term_memories": (
-                        state["long_term_memory_context"]
-                    ),
                 }
             )
+            retrieval_query = response.content.strip()
         except Exception as error:
             return {
-                "error": (
-                    f"{type(error).__name__}: {error}"
-                )
+                "error": f"{type(error).__name__}: {error}"
             }
 
         return {
-            "answer": response.content,
+            "retrieval_query": retrieval_query or state["question"],
             "error": None,
         }
 
-    def route_after_answer(
+    def route_after_query_rewrite(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["error"] is not None:
+            return "end"
+
+        return "rag_answer"
+
+    def route_after_rag_answer_subgraph(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["error"] is not None:
+            return "end"
+
+        return "plan_action"
+
+    def plan_notification_action(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        notification_prefix = "/notify "
+        question = state["question"].strip()
+
+        if not question.startswith(notification_prefix):
+            return {
+                "pending_action": None,
+                "action_status": "not_requested",
+                "error": None,
+            }
+
+        message = question.removeprefix(notification_prefix).strip()
+        if not message:
+            return {"error": "通知内容不能为空。"}
+
+        if notification_tool is None:
+            return {"error": "未配置模拟通知工具。"}
+
+        return {
+            "pending_action": {
+                "action": "send_notification",
+                "message": message,
+                "impact": "向模拟外部通知服务发送一条消息",
+                "cancellable": True,
+            },
+            "action_status": "pending_approval",
+            "error": None,
+        }
+
+    def route_after_action_plan(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["error"] is not None:
+            return "end"
+
+        if state["pending_action"] is None:
+            return "save"
+
+        return "approval"
+
+    def request_notification_approval(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        decision = interrupt(state["pending_action"])
+
+        return {"approval_decision": decision}
+
+    def route_after_action_approval(
+        state: ChatWorkflowState,
+    ) -> str:
+        if state["approval_decision"] == "approved":
+            return "execute"
+
+        return "reject"
+
+    def execute_notification_action(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        try:
+            action_result = notification_tool.send(
+                state["pending_action"]["message"]
+            )
+        except Exception as error:
+            return {
+                "error": f"{type(error).__name__}: {error}"
+            }
+
+        return {
+            "action_status": "executed",
+            "action_result": action_result,
+            "answer": (
+                f"{state['answer']}\n\n操作结果：{action_result}"
+            ),
+            "error": None,
+        }
+
+    def route_after_action_execution(
         state: ChatWorkflowState,
     ) -> str:
         if state["error"] is not None:
             return "end"
 
         return "save"
+
+    def record_notification_rejection(
+        state: ChatWorkflowState,
+    ) -> ChatWorkflowState:
+        action_result = "已取消模拟通知。"
+
+        return {
+            "action_status": "rejected",
+            "action_result": action_result,
+            "answer": (
+                f"{state['answer']}\n\n操作结果：{action_result}"
+            ),
+            "error": None,
+        }
 
     def save_short_history(
         state: ChatWorkflowState,
@@ -664,15 +915,30 @@ def build_chat_workflow_graph(
 
         return {}
 
+    rag_answer_subgraph = build_rag_answer_subgraph(
+        retriever=retriever,
+        semantic_memory_service=semantic_memory_service,
+        chat_model=chat_model,
+    )
     builder = StateGraph(ChatWorkflowState)
 
     builder.add_node("load_short_history", load_short_history)
-    builder.add_node("retrieve_rag", retrieve_rag)
+    builder.add_node("decide_query_rewrite", decide_query_rewrite)
+    builder.add_node("rewrite_retrieval_query", rewrite_retrieval_query)
+    builder.add_node("rag_answer_subgraph", rag_answer_subgraph)
+    builder.add_node("plan_notification_action", plan_notification_action)
     builder.add_node(
-        "load_long_term_memory",
-        load_long_term_memory,
+        "request_notification_approval",
+        request_notification_approval,
     )
-    builder.add_node("generate_answer", generate_answer)
+    builder.add_node(
+        "execute_notification_action",
+        execute_notification_action,
+    )
+    builder.add_node(
+        "record_notification_rejection",
+        record_notification_rejection,
+    )
     builder.add_node("save_short_history", save_short_history)
 
     builder.add_edge(START, "load_short_history")
@@ -681,33 +947,60 @@ def build_chat_workflow_graph(
         route_after_history_load,
         {
             "end": END,
-            "retrieve": "retrieve_rag",
+            "decision": "decide_query_rewrite",
         },
     )
     builder.add_conditional_edges(
-        "retrieve_rag",
-        route_after_retrieval,
+        "decide_query_rewrite",
+        route_after_query_decision,
         {
             "end": END,
-            "memory": "load_long_term_memory",
+            "rewrite": "rewrite_retrieval_query",
+            "rag_answer": "rag_answer_subgraph",
         },
     )
     builder.add_conditional_edges(
-        "load_long_term_memory",
-        route_after_memory,
+        "rewrite_retrieval_query",
+        route_after_query_rewrite,
         {
             "end": END,
-            "answer": "generate_answer",
+            "rag_answer": "rag_answer_subgraph",
         },
     )
     builder.add_conditional_edges(
-        "generate_answer",
-        route_after_answer,
+        "rag_answer_subgraph",
+        route_after_rag_answer_subgraph,
+        {
+            "end": END,
+            "plan_action": "plan_notification_action",
+        },
+    )
+    builder.add_conditional_edges(
+        "plan_notification_action",
+        route_after_action_plan,
+        {
+            "end": END,
+            "approval": "request_notification_approval",
+            "save": "save_short_history",
+        },
+    )
+    builder.add_conditional_edges(
+        "request_notification_approval",
+        route_after_action_approval,
+        {
+            "execute": "execute_notification_action",
+            "reject": "record_notification_rejection",
+        },
+    )
+    builder.add_conditional_edges(
+        "execute_notification_action",
+        route_after_action_execution,
         {
             "end": END,
             "save": "save_short_history",
         },
     )
+    builder.add_edge("record_notification_rejection", "save_short_history")
     builder.add_edge("save_short_history", END)
 
     return builder.compile(checkpointer=checkpointer)

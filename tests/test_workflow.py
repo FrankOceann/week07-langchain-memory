@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableLambda
 import fakeredis
 from app.memory import RedisHistoryStore
 from app.conversation import build_conversation_key
+from app.tools import InMemoryNotificationTool
 
 def test_workflow_processes_nonempty_question():
     graph = build_minimal_graph(InMemorySaver())
@@ -578,6 +579,274 @@ def test_chat_workflow_graph_runs_rag_memory_and_redis_history():
         "假的回答",
     ]
 
+
+def test_chat_workflow_graph_rewrites_follow_up_before_retrieval():
+    def fake_response(prompt_value):
+        return AIMessage(content="假的回答")
+
+    rewrite_prompts = []
+    decision_prompts = []
+
+    def fake_rewrite(prompt_value):
+        rewrite_prompts.append(prompt_value.messages)
+        return AIMessage(
+            content="为什么执行副作用操作前必须获得用户明确确认？"
+        )
+
+    def fake_decider(prompt_value):
+        decision_prompts.append(prompt_value.messages)
+        return AIMessage(content="REWRITE")
+
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).add_messages(
+        [
+            HumanMessage(content="如何确认副作用操作？"),
+            AIMessage(content="执行前必须获得用户明确确认。"),
+        ]
+    )
+    retriever = FakeRetriever()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=retriever,
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(fake_response),
+        query_rewriter=RunnableLambda(fake_rewrite),
+        query_rewrite_decider=RunnableLambda(fake_decider),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "那为什么？",
+        },
+        config={"configurable": {"thread_id": "rewrite-follow-up"}},
+    )
+
+    assert result["retrieval_query"] == (
+        "为什么执行副作用操作前必须获得用户明确确认？"
+    )
+    assert retriever.questions == [
+        "为什么执行副作用操作前必须获得用户明确确认？"
+    ]
+    assert result["should_rewrite"] is True
+    assert len(decision_prompts) == 1
+    assert len(rewrite_prompts) == 1
+
+
+def test_chat_workflow_graph_skips_rewrite_for_complete_question():
+    def fake_response(prompt_value):
+        return AIMessage(content="假的回答")
+
+    rewrite_prompts = []
+
+    def fake_rewrite(prompt_value):
+        rewrite_prompts.append(prompt_value.messages)
+        return AIMessage(content="不应调用改写器")
+
+    def fake_decider(prompt_value):
+        return AIMessage(content="KEEP")
+
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).add_messages(
+        [
+            HumanMessage(content="如何确认副作用操作？"),
+            AIMessage(content="执行前必须获得用户明确确认。"),
+        ]
+    )
+    retriever = FakeRetriever()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=retriever,
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(fake_response),
+        query_rewriter=RunnableLambda(fake_rewrite),
+        query_rewrite_decider=RunnableLambda(fake_decider),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "keep-complete-query"}},
+    )
+
+    assert result["should_rewrite"] is False
+    assert result["retrieval_query"] == "如何确认副作用操作？"
+    assert retriever.questions == ["如何确认副作用操作？"]
+    assert rewrite_prompts == []
+
+
+def test_chat_workflow_graph_stops_when_rewrite_decision_fails():
+    def failing_decider(prompt_value):
+        raise ConnectionError("query decision unavailable")
+
+    chat_calls = []
+    rewrite_calls = []
+
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    history_store.get(
+        build_conversation_key("frank", "session-a")
+    ).add_messages(
+        [
+            HumanMessage(content="如何确认副作用操作？"),
+            AIMessage(content="执行前必须获得用户明确确认。"),
+        ]
+    )
+    retriever = FakeRetriever()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=retriever,
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: chat_calls.append(prompt_value)
+        ),
+        query_rewriter=RunnableLambda(
+            lambda prompt_value: rewrite_calls.append(prompt_value)
+        ),
+        query_rewrite_decider=RunnableLambda(failing_decider),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "那为什么？",
+        },
+        config={"configurable": {"thread_id": "decision-error"}},
+    )
+
+    assert result["error"] == "ConnectionError: query decision unavailable"
+    assert retriever.questions == []
+    assert rewrite_calls == []
+    assert chat_calls == []
+
+
+def test_chat_workflow_graph_interrupts_before_sending_notification():
+    notification_tool = InMemoryNotificationTool()
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="已准备发送通知。")
+        ),
+        notification_tool=notification_tool,
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "/notify 项目测试已经完成",
+        },
+        config={"configurable": {"thread_id": "notify-interrupt"}},
+    )
+
+    interrupts = result["__interrupt__"]
+
+    assert interrupts[0].value == {
+        "action": "send_notification",
+        "message": "项目测试已经完成",
+        "impact": "向模拟外部通知服务发送一条消息",
+        "cancellable": True,
+    }
+    assert notification_tool.sent_messages == []
+
+
+def test_chat_workflow_graph_sends_notification_after_approval():
+    notification_tool = InMemoryNotificationTool()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="已准备发送通知。")
+        ),
+        notification_tool=notification_tool,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "notify-approve"}}
+
+    graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "/notify 项目测试已经完成",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume="approved"), config=config)
+
+    assert notification_tool.sent_messages == ["项目测试已经完成"]
+    assert result["action_status"] == "executed"
+    assert result["action_result"] == "模拟通知已发送：项目测试已经完成"
+
+
+def test_chat_workflow_graph_does_not_send_notification_after_rejection():
+    notification_tool = InMemoryNotificationTool()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="已准备发送通知。")
+        ),
+        notification_tool=notification_tool,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "notify-reject"}}
+
+    graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "/notify 项目测试已经完成",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume="rejected"), config=config)
+
+    assert notification_tool.sent_messages == []
+    assert result["action_status"] == "rejected"
+    assert result["action_result"] == "已取消模拟通知。"
+
+
 def test_chat_workflow_graph_stops_before_model_and_redis_on_memory_error():
     chat_calls = []
 
@@ -727,6 +996,160 @@ def test_chat_workflow_graph_stops_before_model_and_redis_on_retrieval_error():
     assert result["error"] == "ConnectionError: retriever unavailable"
     assert chat_calls == []
     assert history_store.get("session-a").messages == []
+
+
+def test_chat_workflow_graph_retries_transient_retrieval_failure_once():
+    class TransientFailingRetriever:
+        def __init__(self):
+            self.questions = []
+
+        def invoke(self, question: str):
+            self.questions.append(question)
+            if len(self.questions) == 1:
+                raise ConnectionError("retriever temporarily unavailable")
+            return [
+                Document(
+                    page_content="副作用操作执行前必须确认。",
+                    metadata={"source": "agent_safety.txt#chunk-0"},
+                )
+            ]
+
+    retriever = TransientFailingRetriever()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
+        retriever=retriever,
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="第二次检索成功。")
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "retrieval-retry-success"}},
+    )
+
+    assert result["answer"] == "第二次检索成功。"
+    assert result["sources"] == ["agent_safety.txt#chunk-0"]
+    assert result["error"] is None
+    assert retriever.questions == ["如何确认副作用操作？"] * 2
+
+
+def test_rag_answer_subgraph_generates_answer_from_retrieved_context():
+    graph = workflow.build_rag_answer_subgraph(
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="子图生成的回答。")
+        ),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+            "retrieval_query": "如何确认副作用操作？",
+            "history": [],
+        }
+    )
+
+    assert result["answer"] == "子图生成的回答。"
+    assert result["sources"] == [
+        "agent_safety.txt#chunk-0",
+        "agent_safety.txt#chunk-1",
+    ]
+    assert result["error"] is None
+
+
+def test_chat_workflow_graph_returns_fallback_after_retry_is_exhausted():
+    class AlwaysFailingRetriever:
+        def __init__(self):
+            self.questions = []
+
+        def invoke(self, question: str):
+            self.questions.append(question)
+            raise ConnectionError("retriever unavailable")
+
+    chat_calls = []
+    retriever = AlwaysFailingRetriever()
+    semantic_memory_service = FakeSemanticMemoryService()
+    history_store = RedisHistoryStore(
+        fakeredis.FakeRedis(decode_responses=True),
+        max_turns=3,
+        ttl_seconds=30,
+    )
+    graph = workflow.build_chat_workflow_graph(
+        history_store=history_store,
+        retriever=retriever,
+        semantic_memory_service=semantic_memory_service,
+        chat_model=RunnableLambda(
+            lambda prompt_value: chat_calls.append(prompt_value)
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "retrieval-retry-fallback"}},
+    )
+
+    assert result["answer"] == "检索服务暂时不可用，请稍后重试。"
+    assert result["sources"] == []
+    assert retriever.questions == ["如何确认副作用操作？"] * 2
+    assert semantic_memory_service.calls == []
+    assert chat_calls == []
+    assert history_store.get("session-a").messages == []
+
+
+def test_chat_workflow_graph_does_not_retry_non_transient_retrieval_error():
+    class InvalidRequestRetriever:
+        def __init__(self):
+            self.questions = []
+
+        def invoke(self, question: str):
+            self.questions.append(question)
+            raise ValueError("invalid retrieval request")
+
+    retriever = InvalidRequestRetriever()
+    graph = workflow.build_chat_workflow_graph(
+        history_store=RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
+        retriever=retriever,
+        semantic_memory_service=FakeSemanticMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="不应调用模型")
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        {
+            "session_id": "session-a",
+            "user_id": "frank",
+            "question": "如何确认副作用操作？",
+        },
+        config={"configurable": {"thread_id": "retrieval-non-transient"}},
+    )
+
+    assert result["answer"] == "检索服务暂时不可用，请稍后重试。"
+    assert retriever.questions == ["如何确认副作用操作？"]
 
 
 def test_chat_workflow_graph_stops_when_redis_history_load_fails():

@@ -7,11 +7,14 @@ import fakeredis
 from app.chat import (
     build_chat_model,
     ask_question_with_workflow,
+    resume_workflow_action,
+    WorkflowInterrupted,
 )
 from app.memory import RedisHistoryStore
 from langgraph.checkpoint.memory import InMemorySaver
 from app.workflow import build_chat_workflow_graph
 from app.conversation import build_conversation_key
+from app.tools import InMemoryNotificationTool
 
 class FakeRetriever:
     def invoke(self, question: str) -> list[Document]:
@@ -131,6 +134,50 @@ def test_workflow_adapter_raises_error_without_saving_history():
         )
 
     assert history_store.get("session-a").messages == []
+
+
+def test_workflow_adapter_raises_interruption_before_notification_execution():
+    notification_tool = InMemoryNotificationTool()
+    graph = build_chat_workflow_graph(
+        history_store=RedisHistoryStore(
+            fakeredis.FakeRedis(decode_responses=True),
+            max_turns=3,
+            ttl_seconds=30,
+        ),
+        retriever=FakeRetriever(),
+        semantic_memory_service=FakeSemanticLongTermMemoryService(),
+        chat_model=RunnableLambda(
+            lambda prompt_value: AIMessage(content="已准备发送通知。")
+        ),
+        notification_tool=notification_tool,
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(WorkflowInterrupted) as exc_info:
+        ask_question_with_workflow(
+            question="/notify 项目测试已经完成",
+            session_id="session-a",
+            user_id="frank",
+            workflow_graph=graph,
+        )
+
+    assert exc_info.value.action == {
+        "action": "send_notification",
+        "message": "项目测试已经完成",
+        "impact": "向模拟外部通知服务发送一条消息",
+        "cancellable": True,
+    }
+
+    answer, sources = resume_workflow_action(
+        decision="approved",
+        session_id="session-a",
+        user_id="frank",
+        workflow_graph=graph,
+    )
+
+    assert answer.endswith("操作结果：模拟通知已发送：项目测试已经完成")
+    assert sources == ["agent_safety.txt#chunk-0"]
+    assert notification_tool.sent_messages == ["项目测试已经完成"]
 
 
 def test_workflow_adapter_uses_unambiguous_thread_id():

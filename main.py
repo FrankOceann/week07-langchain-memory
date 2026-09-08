@@ -7,8 +7,18 @@ from app.milvus_memory import MilvusMemoryVectorIndex, build_milvus_client
 from app.outbox import MemoryOutboxRepository, MemoryOutboxWorker
 from sqlalchemy.exc import SQLAlchemyError
 from app.semantic_memory import SemanticLongTermMemoryService
-from app.chat import ask_question_with_workflow, build_chat_model
-from app.workflow import build_chat_workflow_graph
+from app.chat import (
+    WorkflowInterrupted,
+    ask_question_with_workflow,
+    build_chat_model,
+    build_workflow_config,
+    resume_workflow_action,
+)
+from app.tools import InMemoryNotificationTool
+from app.workflow import (
+    build_chat_workflow_graph,
+    build_chat_workflow_inspector,
+)
 from app.database import build_session_factory
 from app.embeddings import DashScopeEmbeddings
 from app.long_term_memory import (
@@ -46,6 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     chat = commands.add_parser("chat")
     chat.add_argument("--session-id", required=True)
     chat.add_argument("--user-id", required=True)
+
+    workflow = commands.add_parser("workflow")
+    workflow_commands = workflow.add_subparsers(
+        dest="workflow_command",
+        required=True,
+    )
+    inspect = workflow_commands.add_parser("inspect")
+    inspect.add_argument("--session-id", required=True)
+    inspect.add_argument("--user-id", required=True)
 
     memory = commands.add_parser("memory")
     memory_commands = memory.add_subparsers(
@@ -174,6 +193,60 @@ def run_memory_command(
     raise ValueError("未知的 memory 子命令。")
 
 
+def run_workflow_inspect_command(args) -> int:
+    checkpointer = build_workflow_checkpointer(
+        WORKFLOW_CHECKPOINT_PATH
+    )
+    try:
+        workflow_graph = build_chat_workflow_inspector(checkpointer)
+        config = build_workflow_config(args.user_id, args.session_id)
+        current = workflow_graph.get_state(config)
+        history = list(workflow_graph.get_state_history(config))
+
+        if not history:
+            print("未找到该会话的工作流 checkpoint。")
+            return 0
+
+        values = current.values
+        checkpoint_id = current.config["configurable"].get(
+            "checkpoint_id",
+            "未知",
+        )
+        next_nodes = ", ".join(current.next) or "无（流程已结束）"
+        print(f"当前 checkpoint：{checkpoint_id}")
+        print(f"下一节点：{next_nodes}")
+
+        if question := values.get("question"):
+            print(f"问题：{question}")
+        if sources := values.get("sources"):
+            print(f"检索来源：{', '.join(sources)}")
+        if error := values.get("error"):
+            print(f"错误：{error}")
+        if action := values.get("pending_action"):
+            print(f"待审批动作：{action['action']}")
+            print(f"影响范围：{action['impact']}")
+            print(
+                "可取消："
+                f"{'是' if action.get('cancellable') else '否'}"
+            )
+
+        for snapshot in history:
+            step = snapshot.metadata.get("step", "未知")
+            snapshot_next = ", ".join(snapshot.next) or "结束"
+            snapshot_id = snapshot.config["configurable"].get(
+                "checkpoint_id",
+                "未知",
+            )
+            print(
+                f"历史步骤：{step} -> {snapshot_next} ({snapshot_id})"
+            )
+        return 0
+    finally:
+        connection = getattr(checkpointer, "conn", None)
+        if connection is not None:
+            connection.close()
+
+
 def run_chat_command(
     args,
     repository: SQLAlchemyLongTermMemoryRepository,
@@ -203,12 +276,17 @@ def run_chat_command(
         WORKFLOW_CHECKPOINT_PATH
     )
     try:
+        chat_model = build_chat_model()
+        notification_tool = InMemoryNotificationTool()
         workflow_graph = build_chat_workflow_graph(
             history_store=history_store,
             retriever=retriever,
             semantic_memory_service=semantic_memory_service,
-            chat_model=build_chat_model(),
+            chat_model=chat_model,
             checkpointer=checkpointer,
+            query_rewriter=chat_model,
+            query_rewrite_decider=chat_model,
+            notification_tool=notification_tool,
         )
 
         print(f"当前会话：{args.session_id}")
@@ -237,6 +315,44 @@ def run_chat_command(
                     user_id=args.user_id,
                     workflow_graph=workflow_graph,
                 )
+            except WorkflowInterrupted as interruption:
+                action = interruption.action
+                print(f"待确认操作：{action['action']}")
+                print(f"内容：{action['message']}")
+                print(f"影响范围：{action['impact']}")
+                print("可取消：是（尚未发送）")
+
+                while True:
+                    try:
+                        confirmation = input(
+                            "输入 confirm 执行，cancel 取消："
+                        ).strip().lower()
+                    except EOFError:
+                        confirmation = "cancel"
+
+                    if confirmation == "confirm":
+                        decision = "approved"
+                        break
+
+                    if confirmation == "cancel":
+                        decision = "rejected"
+                        break
+
+                    print("请输入 confirm 或 cancel。")
+
+                try:
+                    answer, sources = resume_workflow_action(
+                        decision=decision,
+                        session_id=args.session_id,
+                        user_id=args.user_id,
+                        workflow_graph=workflow_graph,
+                    )
+                except WorkflowInterrupted:
+                    print("错误：操作恢复后仍在等待确认。")
+                    continue
+                except RuntimeError as error:
+                    print(f"错误：{error}")
+                    continue
             except RuntimeError as error:
                 print(f"错误：{error}")
                 continue
@@ -255,6 +371,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
+        if args.command == "workflow":
+            if args.workflow_command == "inspect":
+                return run_workflow_inspect_command(args)
+
+            raise ValueError("未知的 workflow 子命令。")
+
         repository = SQLAlchemyLongTermMemoryRepository(
             build_session_factory()
         )

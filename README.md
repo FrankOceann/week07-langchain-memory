@@ -1,6 +1,6 @@
 # Week08 LangGraph RAG + Memory
 
-> 当前可运行版本已迁移至 LangGraph：保留 Redis 短期记忆、MySQL 权威长期记忆、Milvus 语义召回与 MySQL Outbox 异步索引同步，并增加显式工作流状态、SQLite checkpoint、错误短路和人工审批示例。下方各节保留阶段学习记录；实际运行请优先使用本节的“当前系统运行手册”。
+> 当前可运行版本已迁移至 LangGraph：保留 Redis 短期记忆、MySQL 权威长期记忆、Milvus 语义召回与 MySQL Outbox 异步索引同步，并增加显式工作流状态、SQLite checkpoint、历史感知查询改写、错误短路与真实聊天中的人工确认（HITL）示例。LangGraph 专题至此完成；下一阶段将学习 MCP 的标准化工具接入。下方各节保留阶段学习记录；实际运行请优先使用本节的“当前系统运行手册”。
 
 ## 当前系统与运行手册
 
@@ -9,14 +9,27 @@
 ```text
 START
   -> load_short_history：Redis 读取最近 3 轮短期对话
-  -> retrieve_rag：本地 RAG Retriever 重新检索本轮资料 Top-3
-  -> load_long_term_memory：Milvus 按 user_id 召回候选 ID，MySQL 回读并验证权威正文
-  -> generate_answer：资料作为事实依据，长期记忆仅作个性化参考
+  -> decide_query_rewrite：根据历史判断保留原问题，或改写为完整检索问题
+  -> [可选] rewrite_retrieval_query：将“那为什么？”等追问补全后再检索
+  -> rag_answer_subgraph：准备回答所需的资料与答案
+  -> plan_notification_action：识别显式的 /notify 模拟通知命令
+  -> [可选] interrupt：展示操作内容与影响范围，等待用户 confirm 或 cancel
+  -> [可选] execute_notification_action / record_notification_rejection
   -> save_short_history：Redis 写入本轮用户/助手消息
   -> END
 
 任一节点发生错误 -> END；不会继续调用后续节点，也不会在失败后写入短期历史。
 ```
+
+其中 `rag_answer_subgraph` 是由父图调用、共享 `ChatWorkflowState` 的已编译子图：
+
+```text
+retrieve_rag（ConnectionError 最多重试 1 次）
+  -> generate_retrieval_fallback（重试耗尽或不可重试错误）
+  或 -> load_long_term_memory -> generate_answer
+```
+
+子图不单独配置 checkpointer，而是继承父图的持久化边界；子图失败或返回降级回答后，父图直接结束，不会进入通知或历史保存。
 
 | 组件 | 边界 | 当前职责 |
 | --- | --- | --- |
@@ -57,7 +70,17 @@ MILVUS_URI=http://127.0.0.1:19530
 .venv\Scripts\python.exe main.py memory outbox retry-failed --all
 
 .venv\Scripts\python.exe main.py chat --session-id demo-session --user-id frank
+.venv\Scripts\python.exe main.py workflow inspect --session-id demo-session --user-id frank
 ```
+
+在聊天中可使用安全的内存通知演示：
+
+```text
+/notify 项目测试已经完成
+confirm
+```
+
+程序会先展示待执行操作、通知内容、影响范围及可取消性。只有输入精确的 `confirm` 才会调用模拟通知工具；输入 `cancel` 或结束输入则取消。该工具仅把消息保存在当前 Python 进程内存中，不会发送网络请求、写文件或写数据库；进程退出后记录消失。
 
 ### Week08 工作流行为
 
@@ -66,6 +89,10 @@ MILVUS_URI=http://127.0.0.1:19530
 - `main.py` 使用 `data/workflow-checkpoints.sqlite` 保存 checkpoint。该文件及其 WAL/SHM 伴随文件已被 `.gitignore` 忽略；不要把真实对话 checkpoint 提交到仓库。
 - RAG、长期记忆、模型或 Redis 读取失败时，CLI 会显示 `错误：...` 并允许继续提问；失败轮次不会写入 Redis。
 - `build_minimal_graph()` 演示 `interrupt()` 人工审批：状态停在 checkpoint 后，只能由 `Command("approved")` 或 `Command("rejected")` 恢复。
+- 实际聊天图也使用 `interrupt()`：`/notify <消息>` 必须经过用户确认，CLI 使用 `Command(resume="approved")` 或 `Command(resume="rejected")` 从同一个 checkpoint 恢复。通知工具不会被自动重试，避免重复副作用。
+- 存在历史时，查询决策器只输出 `KEEP` 或 `REWRITE`；`KEEP` 保持原检索问题，`REWRITE` 生成完整检索问题。查询决策或改写失败会短路，不会继续检索或写入历史。
+- `build_rag_answer_subgraph()` 将检索、重试/降级、长期记忆和回答收拢为可独立测试的 LangGraph 子图；父图只负责会话、查询理解、HITL 与保存。
+- `workflow inspect` 只打开 SQLite checkpoint 并读取当前状态与历史快照；它不会初始化模型、Redis、Milvus、MySQL 或执行恢复。输出只包含问题、来源、错误、节点和审批动作摘要，不显示通知正文、长期记忆正文或 Prompt。
 
 ### Week08 离线验证
 
@@ -73,7 +100,23 @@ MILVUS_URI=http://127.0.0.1:19530
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前完整离线测试基线为 **90 passed**。测试使用 Fake Redis、Fake Retriever、Fake Chat Model 和临时 SQLite 文件；不读取真实 API Key，也不需要 Docker 服务。
+当前完整离线测试基线为 **106 passed**。测试使用 Fake Redis、Fake Retriever、Fake Chat Model、内存通知工具和临时 SQLite 文件；不读取真实 API Key，也不需要 Docker 服务。
+
+### 下一阶段：MCP 学习预告
+
+MCP（Model Context Protocol）是让 AI 客户端以统一方式发现和调用外部工具、资源与提示模板的协议。它不替代 LangGraph：LangGraph 负责编排状态、重试和人工确认；MCP 负责将外部能力以标准接口提供给这些工作流。
+
+第一课将继续在本项目中进行：把当前 `app/tools.py` 的内存模拟通知能力包装为本地 `stdio` MCP Server，并通过 MCP Client 从 LangGraph 调用它。该阶段仍然不会接入真实短信、邮件、文件写入或企业服务；`/notify` 的 HITL 确认流程、参数校验和离线测试必须保持有效。
+
+```text
+LangGraph 工作流
+  -> 用户人工确认（HITL）
+  -> MCP Client
+  -> 本地 stdio MCP Server
+  -> 内存模拟通知工具
+```
+
+这样可以先学习 MCP 的工具声明、参数 Schema、客户端发现与调用、错误返回和测试边界，再逐步理解企业系统中的权限、审计和真实服务接入。
 
 ## 第一节：LangChain Retriever
 
@@ -446,4 +489,4 @@ Milvus 的默认 bounded staleness 一致性可能造成“刚写入、立即搜
 | 3 | 可观测性与真实集成测试 | 出现慢请求、同步堆积或串租户时，需要可定位、可报警。 | 结构化日志、请求 ID、耗时/失败指标、Docker 集成测试。 |
 | 4 | 部署、安全与运维 | 学习环境不等于生产环境。 | 应用容器化、密钥管理、TLS/RBAC、备份恢复、健康检查与发布流程。 |
 
-下一阶段进入 **LangGraph**：以当前已经可恢复、可补偿的记忆基础设施为底座，学习显式工作流状态、checkpoint、恢复执行与人工审批。
+当前正在完成 **LangGraph** 专题：已覆盖显式状态、条件边、checkpoint、恢复执行、历史感知查询改写、人工确认、可重试错误/降级、Subgraph 和只读状态检查。下一步进入 MCP，将当前的内存模拟工具替换为真实、受控的外部工具协议。
